@@ -1,0 +1,562 @@
+﻿#Requires -Version 5.1
+<#
+================================================================================
+ MiDrop-Menu.ps1  ——  一键安装主程序（管理员方式由「一键安装.cmd」调用）
+================================================================================
+ 由同目录下的「一键安装.cmd」双击启动；也可在管理员 PowerShell 里直接运行。
+
+ 功能
+   1) 路线 B 安装  —— 签名 .msix，不改任何系统全局开关      [推荐]
+   2) 路线 A 安装  —— 免 SDK 免证书，但会开启「开发人员模式」
+   3) 体验一下      —— 临时启用，重启电脑后自动失效，不留痕迹
+   4) 彻底删除      —— 注销包 + 还原开关 + 移除证书 + 删除全部生成文件
+   5) 查看当前状态
+   0) 退出
+================================================================================
+#>
+[CmdletBinding()]
+param(
+    [switch]$NoPause
+)
+
+$ErrorActionPreference = 'Continue'
+$Host.UI.RawUI.WindowTitle = 'MiDrop Win11 右键菜单 - 一键安装'
+
+# ------------------------------------------------------------------ 常量
+$AppName     = 'MiDropWin11Menu'
+$PackageName = 'MiDropWin11MenuShim'
+$CertSubject = 'CN=MiDropWin11MenuShim'
+$StageRoot   = Join-Path $env:ProgramData 'MiDropWin11Menu'
+$StageSparse = Join-Path $StageRoot 'sparse'
+$BackupRoot  = Join-Path $StageRoot 'backup'
+$StateFile   = Join-Path $StageRoot 'install-state.json'
+$MsixPath    = Join-Path $StageRoot 'MiDropWin11MenuShim.msix'
+$RegKey      = 'HKLM:\SOFTWARE\Classes'
+$Clsid       = '{504d69c0-cb52-48df-b5b5-7161829fabc8}'
+$VerbFile    = 'HKLM\SOFTWARE\Classes\*\shell\MiDropExtMenu'
+$VerbDir     = 'HKLM\SOFTWARE\Classes\Directory\shell\MiDropExtMenu'
+$UnlockKey   = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock'
+
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+if ($PSCommandPath) { $ScriptDir = Split-Path -Parent $PSCommandPath }
+
+# ------------------------------------------------------------------ 工具函数
+function Write-Line { Write-Host ('=' * 62) -ForegroundColor DarkGray }
+function Info($m) { Write-Host "[..] $m" -ForegroundColor Cyan }
+function Ok($m)   { Write-Host "[OK] $m" -ForegroundColor Green }
+function Warn($m) { Write-Host "[!!] $m" -ForegroundColor Yellow }
+function Err($m)  { Write-Host "[XX] $m" -ForegroundColor Red }
+
+function Assert-Admin {
+    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $p  = New-Object Security.Principal.WindowsPrincipal($id)
+    if (-not $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        Err '未获得管理员权限，无法继续。'
+        Err '请在弹出的 UAC 窗口点「是」，或右键「一键安装.cmd」选「以管理员身份运行」。'
+        return $false
+    }
+    return $true
+}
+
+function Assert-Win11 {
+    $b = [int](Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion').CurrentBuild
+    if ($b -lt 22000) {
+        Err "当前系统内部版本 $b，不是 Windows 11，没有新版右键菜单。"
+        return $false
+    }
+    if (-not [Environment]::Is64BitOperatingSystem) {
+        Err '当前系统不是 64 位，本方案不适用。'
+        return $false
+    }
+    return $true
+}
+
+# 定位小米组件目录（自动挑最高版本）
+function Get-MiDropDir {
+    $root = Join-Path ${env:ProgramFiles} 'MI\HyperConnect'
+    if (-not (Test-Path -LiteralPath $root)) { return $null }
+    $hit = Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+        $dll = Join-Path $_.FullName 'resources\native-interconnect\win32\MiDropShellExt.dll'
+        $exe = Join-Path $_.FullName 'resources\native-interconnect\win32\MiPcContinuity.exe'
+        if ((Test-Path -LiteralPath $dll) -and (Test-Path -LiteralPath $exe)) {
+            $v = [version]'0.0.0.0'
+            try { $v = [version]$_.Name } catch { }
+            [pscustomobject]@{ Version = $v; Win32 = Split-Path $dll -Parent; Dll = $dll; DirName = $_.Name }
+        }
+    } | Sort-Object Version -Descending
+    if (-not $hit) { return $null }
+    return $hit[0]
+}
+
+function Backup-Registry {
+    if (-not (Test-Path -LiteralPath $BackupRoot)) {
+        New-Item -ItemType Directory -Path $BackupRoot -Force | Out-Null
+    }
+    $ts = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $targets = @{
+        "CLSID-$ts.reg"    = "HKLM\SOFTWARE\Classes\CLSID\$Clsid"
+        "VerbStar-$ts.reg" = $VerbFile
+        "VerbDir-$ts.reg"  = $VerbDir
+    }
+    $ok = $true
+    foreach ($k in $targets.Keys) {
+        $dest = Join-Path $BackupRoot $k
+        & "$env:WINDIR\System32\reg.exe" export $targets[$k] $dest /y 2>&1 | Out-Null
+        if (-not (Test-Path -LiteralPath $dest)) { $ok = $false }
+    }
+    return $ok
+}
+
+# 准备稀疏包目录：从脚本同级的 sparse\ 复制清单，从组件目录复制图标
+function Install-Stage([string]$Win32Dir) {
+    $src = Join-Path $ScriptDir 'sparse\AppxManifest.xml'
+    if (-not (Test-Path -LiteralPath $src)) {
+        Err "找不到 $src"
+        Err '请确保 sparse 文件夹与「一键安装.cmd」在同一目录。'
+        return $false
+    }
+    if (Test-Path -LiteralPath $StageSparse) {
+        Remove-Item -LiteralPath $StageSparse -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    New-Item -ItemType Directory -Path (Join-Path $StageSparse 'Assets') -Force | Out-Null
+    Copy-Item -LiteralPath $src -Destination (Join-Path $StageSparse 'AppxManifest.xml') -Force
+
+    $assets = Join-Path $Win32Dir 'Assets'
+    $map = @{
+        'StoreLogo.png'                   = @('StoreLogo.png')
+        'Square150x150Logo.scale-200.png' = @('Square150x150Logo.scale-200.png', 'Square150x150Logo.png')
+        'Square44x44Logo.scale-200.png'   = @('Square44x44Logo.scale-200.png', 'Square44x44Logo.png')
+    }
+    foreach ($k in $map.Keys) {
+        $s = Join-Path $assets $k
+        if (Test-Path -LiteralPath $s) {
+            foreach ($n in $map[$k]) { Copy-Item -LiteralPath $s -Destination (Join-Path $StageSparse "Assets\$n") -Force }
+        }
+    }
+    return $true
+}
+
+function Remove-Package {
+    $pkgs = @(Get-AppxPackage -Name $PackageName -ErrorAction SilentlyContinue)
+    if ($pkgs.Count -eq 0) { return $true }
+    foreach ($p in $pkgs) { Remove-AppxPackage -Package $p.PackageFullName -ErrorAction SilentlyContinue }
+    Start-Sleep -Seconds 1
+    return (@(Get-AppxPackage -Name $PackageName -ErrorAction SilentlyContinue).Count -eq 0)
+}
+
+function Find-SdkTool([string]$name) {
+    foreach ($root in @("${env:ProgramFiles(x86)}\Windows Kits\10\bin", "$env:ProgramFiles\Windows Kits\10\bin")) {
+        if (-not (Test-Path $root)) { continue }
+        $hit = Get-ChildItem -LiteralPath $root -Recurse -Filter $name -ErrorAction SilentlyContinue |
+               Where-Object { (Split-Path $_.DirectoryName -Leaf) -ieq 'x64' } |
+               Sort-Object FullName -Descending | Select-Object -First 1
+        if ($hit) { return $hit.FullName }
+    }
+    return $null
+}
+
+function Restart-ExplorerNow {
+    Info '正在重启资源管理器，右键菜单即将刷新 ...'
+    Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 2
+    if (-not (Get-Process -Name explorer -ErrorAction SilentlyContinue)) {
+        Start-Process explorer.exe | Out-Null
+    }
+    Ok '资源管理器已重启。'
+}
+
+function Save-State([hashtable]$data) {
+    $data.InstalledAt = (Get-Date).ToString('o')
+    $data | ConvertTo-Json | Set-Content -LiteralPath $StateFile -Encoding UTF8 -Force
+}
+
+# ------------------------------------------------------------------ 安装动作
+function Invoke-RegisterPackage([string]$Win32Dir, [string]$Route, [bool]$DevModeChanged, [string]$Thumb) {
+    Info '正在注册稀疏包 ...'
+    try {
+        if ($Route -eq 'A') {
+            Add-AppxPackage -Path (Join-Path $StageSparse 'AppxManifest.xml') -Register -ExternalLocation $Win32Dir -ErrorAction Stop
+        }
+        else {
+            Add-AppxPackage -Path $MsixPath -ExternalLocation $Win32Dir -ErrorAction Stop
+        }
+    }
+    catch {
+        Err "注册失败：$($_.Exception.Message)"
+        Warn '排查方法：在 PowerShell 里运行  Get-AppxLog -All  查看详细原因。'
+        return $false
+    }
+    $pkg = Get-AppxPackage -Name $PackageName -ErrorAction SilentlyContinue
+    if (-not $pkg) {
+        Err '命令返回成功但查不到包，请运行 Get-AppxLog -All 排查。'
+        return $false
+    }
+    Ok "已注册：$($pkg.PackageFullName)"
+    Save-State @{
+        Route              = $Route
+        PackageFullName    = $pkg.PackageFullName
+        ExternalLocation   = $Win32Dir
+        DevModeChangedByUs = $DevModeChanged
+        CertThumbprint     = $Thumb
+        BackupDir          = $BackupRoot
+    }
+    return $true
+}
+
+function Install-RouteA([bool]$Trial) {
+    Write-Line
+    Write-Host ('  ' + $(if ($Trial) { '体验模式（路线 A，重启后自动失效）' } else { '路线 A 安装' })) -ForegroundColor Cyan
+    Write-Line
+
+    if (-not $Trial) {
+        Warn '此路线需要开启系统「开发人员模式」（一个全局开关）。'
+        Warn '若不想改全局开关，请改用路线 B。'
+        Write-Host ''
+    }
+
+    $mi = Get-MiDropDir
+    if (-not $mi) { Err '未找到小米互联服务的组件目录，请先安装小米互联服务。'; return }
+    Ok "组件目录：$($mi.Win32)（版本 $($mi.DirName)）"
+
+    if (-not (Test-Path -LiteralPath "$RegKey\CLSID\$Clsid\InprocServer32")) {
+        Err '原厂右键注册不存在，请先修复或重装小米互联服务。'
+        return
+    }
+
+    Info '备份原厂注册表 ...'
+    if (Backup-Registry) { Ok "备份已保存到 $BackupRoot" } else { Warn '部分备份未成功（不影响安装）。' }
+
+    if (-not (Install-Stage $mi.Win32)) { return }
+
+    # 开发人员模式
+    $devOn = $false
+    if (Test-Path $UnlockKey) { $devOn = ((Get-ItemProperty $UnlockKey).AllowDevelopmentWithoutDevLicense -eq 1) }
+    $changed = $false
+    if (-not $devOn) {
+        Info '正在开启「开发人员模式」...'
+        New-Item -Path $UnlockKey -Force | Out-Null
+        New-ItemProperty -Path $UnlockKey -Name 'AllowDevelopmentWithoutDevLicense' -PropertyType DWord -Value 1 -Force | Out-Null
+        $changed = $true
+        Ok '已开启（卸载时会自动还原）。'
+    } else {
+        Ok '「开发人员模式」已经是开启状态。'
+    }
+
+    Remove-Package | Out-Null
+
+    if (-not (Invoke-RegisterPackage $mi.Win32 'A' $changed '')) { return }
+
+    if ($Trial) {
+        Write-Host ''
+        Ok '已临时启用！右键文件即可看到效果。'
+        Warn '这是体验模式：重启电脑后自动失效，不留任何痕迹。'
+        Warn '注意：此时「开发人员模式」仍处于开启状态，按 [4] 彻底删除可还原。'
+    }
+    else {
+        Restart-ExplorerNow
+        Write-Host ''
+        Ok '安装完成！请右键任意文件或文件夹查看效果。'
+        Warn '若未出现，请注销重登一次再试。'
+    }
+    Write-Host ''
+    Warn '请务必先右键【单个文件】测试：互传窗口弹出且能看到该文件才算成功。'
+    Warn '若窗口弹出但列表为空，说明本方案在你的环境不可用，请按 [4] 彻底删除。'
+}
+
+function Install-RouteB {
+    Write-Line
+    Write-Host '  路线 B 安装（签名 .msix，不改系统全局开关）[推荐]' -ForegroundColor Cyan
+    Write-Line
+
+    $mi = Get-MiDropDir
+    if (-not $mi) { Err '未找到小米互联服务的组件目录，请先安装小米互联服务。'; return }
+    Ok "组件目录：$($mi.Win32)（版本 $($mi.DirName)）"
+
+    $makeappx = Find-SdkTool 'makeappx.exe'
+    $signtool = Find-SdkTool 'signtool.exe'
+    if (-not $makeappx -or -not $signtool) {
+        Warn '未检测到 Windows SDK 的签名工具（MakeAppx.exe / SignTool.exe）。'
+        Warn '路线 B 需要它。你可以：'
+        Write-Host '   a) 现在自动安装（推荐，体积很小，约需几分钟）'
+        Write-Host '   b) 改用路线 A（免 SDK，但要开「开发人员模式」）'
+        Write-Host '   c) 返回主菜单'
+        $c = (Read-Host '   请选择 a/b/c').Trim().ToLower()
+        if ($c -eq 'a') {
+            Info '正在通过 winget 安装 Windows SDK，请稍候 ...'
+            winget install --id Microsoft.WindowsSDK.10.0.26100 --accept-package-agreements --accept-source-agreements
+            $makeappx = Find-SdkTool 'makeappx.exe'
+            $signtool = Find-SdkTool 'signtool.exe'
+            if (-not $makeappx -or -not $signtool) {
+                Err '安装后仍未找到工具。请重新打开本窗口再试，或改用路线 A。'
+                return
+            }
+            Ok 'SDK 已就绪。'
+        }
+        elseif ($c -eq 'b') { Install-RouteA $false; return }
+        else { return }
+    }
+
+    if (-not (Test-Path -LiteralPath "$RegKey\CLSID\$Clsid\InprocServer32")) {
+        Err '原厂右键注册不存在，请先修复或重装小米互联服务。'
+        return
+    }
+
+    Info '备份原厂注册表 ...'
+    if (Backup-Registry) { Ok "备份已保存到 $BackupRoot" } else { Warn '部分备份未成功（不影响安装）。' }
+
+    if (-not (Install-Stage $mi.Win32)) { return }
+
+    # 自签名证书
+    Info '准备签名证书 ...'
+    $cert = Get-ChildItem Cert:\CurrentUser\My -ErrorAction SilentlyContinue |
+            Where-Object { $_.Subject -eq $CertSubject } |
+            Sort-Object NotAfter -Descending | Select-Object -First 1
+    if (-not $cert) {
+        try {
+            $cert = New-SelfSignedCertificate -Type Custom -Subject $CertSubject `
+                -KeyUsage DigitalSignature -FriendlyName 'MiDrop Win11 Menu Shim' `
+                -CertStoreLocation 'Cert:\CurrentUser\My' -NotAfter (Get-Date).AddYears(5) `
+                -TextExtension @('2.5.29.37={text}1.3.6.1.5.5.7.3.3', '2.5.29.19={text}') -ErrorAction Stop
+        }
+        catch { Err "证书创建失败：$($_.Exception.Message)"; return }
+    }
+    Ok "证书指纹 $($cert.Thumbprint)"
+
+    $pwdPlain = -join ((65..90) + (97..122) + (48..57) | Get-Random -Count 32 | ForEach-Object { [char]$_ })
+    $pwd  = ConvertTo-SecureString -String $pwdPlain -Force -AsPlainText
+    $pfx  = Join-Path $StageRoot 'signing.pfx'
+    $cer  = Join-Path $StageRoot 'signing.cer'
+    Export-PfxCertificate -Cert $cert -FilePath $pfx -Password $pwd -Force | Out-Null
+    Export-Certificate  -Cert $cert -FilePath $cer -Force | Out-Null
+    Import-Certificate -FilePath $cer -CertStoreLocation 'Cert:\LocalMachine\TrustedPeople' | Out-Null
+    Ok '公钥已加入系统信任列表（卸载时会移除）。'
+
+    # 打包 + 签名
+    Info '打包并签名 .msix ...'
+    & $makeappx pack /o /d $StageSparse /nv /p $MsixPath 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) { Err "MakeAppx 打包失败，退出码 $LASTEXITCODE"; Remove-Item -LiteralPath $pfx -Force -ErrorAction SilentlyContinue; return }
+    & $signtool sign /fd SHA256 /f $pfx /p $pwdPlain $MsixPath 2>&1 | Out-Null
+    Remove-Item -LiteralPath $pfx -Force -ErrorAction SilentlyContinue
+    if ($LASTEXITCODE -ne 0) { Err "SignTool 签名失败，退出码 $LASTEXITCODE"; return }
+    Ok '签名完成，私钥文件已销毁。'
+
+    Remove-Package | Out-Null
+    if (-not (Invoke-RegisterPackage $mi.Win32 'B' $false $cert.Thumbprint)) { return }
+
+    Restart-ExplorerNow
+    Write-Host ''
+    Ok '安装完成！请右键任意文件或文件夹查看效果。'
+    Warn '若未出现，请注销重登一次再试。'
+    Write-Host ''
+    Warn '请务必先右键【单个文件】测试：互传窗口弹出且能看到该文件才算成功。'
+    Warn '若窗口弹出但列表为空，说明本方案在你的环境不可用，请按 [4] 彻底删除。'
+}
+
+# ------------------------------------------------------------------ 彻底删除
+function Invoke-FullRemoval {
+    Write-Line
+    Write-Host '  彻底删除（注销 + 还原开关 + 移除证书 + 删除全部生成文件）' -ForegroundColor Cyan
+    Write-Line
+
+    $state = $null
+    if (Test-Path -LiteralPath $StateFile) {
+        try { $state = Get-Content -LiteralPath $StateFile -Raw | ConvertFrom-Json } catch { }
+    }
+
+    Write-Host '  此操作会：' -ForegroundColor DarkGray
+    Write-Host '    1. 注销右键菜单包（新菜单里的条目消失）'
+    Write-Host '    2. 还原「开发人员模式」开关（若当初由本脚本开启）'
+    Write-Host '    3. 移除自签名证书'
+    Write-Host '    4. 删除 C:\ProgramData\MiDropWin11Menu（含注册表备份）'
+    Write-Host '  不会动小米互联服务本身及其原厂右键注册。'
+    Write-Host ''
+    $c = (Read-Host '  确认删除？输入 y 继续，其它取消').Trim().ToLower()
+    if ($c -ne 'y') { Info '已取消。'; return }
+
+    Write-Host ''
+    Info '1/4 注销包 ...'
+    if (Remove-Package) { Ok '已注销（或本就未安装）。' } else { Warn '包可能仍被占用，请注销重登后重试一次。' }
+
+    Info '2/4 还原「开发人员模式」...'
+    if ($state -and $state.DevModeChangedByUs -eq $true) {
+        if (Test-Path $UnlockKey) {
+            Set-ItemProperty -Path $UnlockKey -Name 'AllowDevelopmentWithoutDevLicense' -Value 0 -Type DWord -Force
+            Ok '已还原为关闭。'
+        }
+    }
+    else {
+        $keep = (Read-Host '    未记录是否由本脚本开启过。要把「开发人员模式」关掉吗？(y/n)').Trim().ToLower()
+        if ($keep -eq 'y' -and (Test-Path $UnlockKey)) {
+            Set-ItemProperty -Path $UnlockKey -Name 'AllowDevelopmentWithoutDevLicense' -Value 0 -Type DWord -Force
+            Ok '已关闭。'
+        }
+        else { Info '保持原状。' }
+    }
+
+    Info '3/4 移除证书 ...'
+    $n = 0
+    foreach ($c2 in @(Get-ChildItem Cert:\LocalMachine\TrustedPeople -ErrorAction SilentlyContinue | Where-Object { $_.Subject -eq $CertSubject })) {
+        Remove-Item -LiteralPath $c2.PSPath -Force -ErrorAction SilentlyContinue; $n++
+    }
+    foreach ($c2 in @(Get-ChildItem Cert:\CurrentUser\My -ErrorAction SilentlyContinue | Where-Object { $_.Subject -eq $CertSubject })) {
+        Remove-Item -LiteralPath $c2.PSPath -Force -ErrorAction SilentlyContinue; $n++
+    }
+    Ok "已移除 $n 张证书。"
+
+    Info '4/4 删除生成文件 ...'
+    Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 1
+    # 等 dllhost 释放句柄，最多 15 秒
+    $deadline = (Get-Date).AddSeconds(15)
+    while ((Get-Date) -lt $deadline) {
+        Get-Process dllhost -ErrorAction SilentlyContinue | Where-Object {
+            $_.Modules -match 'MiDropShellExt'
+        } | Stop-Process -Force -ErrorAction SilentlyContinue
+        if (Test-Path -LiteralPath $StageRoot) {
+            Remove-Item -LiteralPath $StageRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        if (-not (Test-Path -LiteralPath $StageRoot)) { break }
+        Start-Sleep -Seconds 2
+    }
+    if (Test-Path -LiteralPath $StageRoot) {
+        Warn "未能完全删除：$StageRoot"
+        Warn '通常是 DLL 仍被占用。请重启电脑后手动删除该文件夹。'
+    }
+    else { Ok "已删除 $StageRoot" }
+
+    if (-not (Get-Process -Name explorer -ErrorAction SilentlyContinue)) { Start-Process explorer.exe | Out-Null }
+
+    Write-Host ''
+    Info '检查原厂右键注册是否完好 ...'
+    $bad = @()
+    $mustExist = @(
+        "$RegKey\CLSID\$Clsid\InprocServer32",
+        "$RegKey\*\shell\MiDropExtMenu",
+        "$RegKey\Directory\shell\MiDropExtMenu"
+    )
+    foreach ($p in $mustExist) {
+        if (-not (Test-Path -LiteralPath $p)) { $bad += $p }
+    }
+    if ($bad.Count -eq 0) {
+        Ok '原厂注册完好：「显示更多选项」里的入口不受影响。'
+    }
+    else {
+        Warn '以下原厂注册缺失（本方案不会删除它们，可能是其他原因）：'
+        $bad | ForEach-Object { Warn "    $_" }
+        Warn '可用同目录下 reg\Restore-MiDrop-Original.reg 修复（用 64 位 regedit 导入）。'
+    }
+    Write-Host ''
+    Ok '清理完成，系统已恢复。'
+}
+
+# ------------------------------------------------------------------ 状态
+function Show-Status {
+    Write-Line
+    Write-Host '  当前状态' -ForegroundColor Cyan
+    Write-Line
+
+    $cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+    $arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'AMD64') { '64 位' } else { $env:PROCESSOR_ARCHITECTURE }
+    Write-Host '  系统               ' -NoNewline -ForegroundColor Gray
+    Write-Host "Windows 内部版本 $($cv.CurrentBuild).$($cv.UBR) / $arch"
+
+    $mi = Get-MiDropDir
+    if ($mi) {
+        Write-Host '  小米组件           ' -NoNewline -ForegroundColor Gray; Write-Host "$($mi.Win32)"
+        Write-Host '  组件版本           ' -NoNewline -ForegroundColor Gray; Write-Host $mi.DirName
+    }
+    else {
+        Write-Host '  小米组件           ' -NoNewline -ForegroundColor Gray; Write-Host '未找到' -ForegroundColor Red
+    }
+
+    $pkg = Get-AppxPackage -Name $PackageName -ErrorAction SilentlyContinue
+    if ($pkg) {
+        Write-Host '  右键菜单包         ' -NoNewline -ForegroundColor Gray; Write-Host '已安装' -ForegroundColor Green
+        Write-Host '  注册方式           ' -NoNewline -ForegroundColor Gray; Write-Host "$($pkg.SignatureKind) / $($pkg.PackageFullName)"
+        Write-Host '  外部位置           ' -NoNewline -ForegroundColor Gray
+        if ($state = (Get-Content -LiteralPath $StateFile -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json)) {
+            $ext = $state.ExternalLocation
+            if ($ext -and (Test-Path -LiteralPath $ext)) { Write-Host "$ext （有效）" -ForegroundColor Green }
+            else { Write-Host "$ext （已失效，组件可能已升级，请重新安装）" -ForegroundColor Red }
+        }
+        else { Write-Host '状态文件缺失' -ForegroundColor Yellow }
+    }
+    else {
+        Write-Host '  右键菜单包         ' -NoNewline -ForegroundColor Gray; Write-Host '未安装' -ForegroundColor Yellow
+    }
+
+    $dev = '未开启'
+    if (Test-Path $UnlockKey) { $dev = if ((Get-ItemProperty $UnlockKey).AllowDevelopmentWithoutDevLicense -eq 1) { '已开启' } else { '未开启' } }
+    Write-Host '  开发人员模式       ' -NoNewline -ForegroundColor Gray
+    Write-Host $dev -ForegroundColor $(if ($dev -eq '已开启') { 'Yellow' } else { 'Green' })
+
+    $cls = Test-Path -LiteralPath "$RegKey\CLSID\$Clsid\InprocServer32"
+    Write-Host '  原厂右键注册       ' -NoNewline -ForegroundColor Gray
+    Write-Host $(if ($cls) { '完好' } else { '缺失' }) -ForegroundColor $(if ($cls) { 'Green' } else { 'Red' })
+
+    $mk = Find-SdkTool 'makeappx.exe'
+    Write-Host '  Windows SDK 工具   ' -NoNewline -ForegroundColor Gray
+    Write-Host $(if ($mk) { '已安装' } else { '未安装（路线 B 需要）' }) -ForegroundColor $(if ($mk) { 'Green' } else { 'Yellow' })
+
+    $old = Test-Path -LiteralPath 'HKCU:\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}'
+    Write-Host '  旧菜单全局回退     ' -NoNewline -ForegroundColor Gray
+    Write-Host $(if ($old) { '已开启（整个右键菜单已回退 Win10 样式）' } else { '未开启（正常）' }) -ForegroundColor $(if ($old) { 'Yellow' } else { 'Green' })
+
+    Write-Host '  暂存目录           ' -NoNewline -ForegroundColor Gray
+    Write-Host $(if (Test-Path -LiteralPath $StageRoot) { $StageRoot } else { '不存在' })
+    Write-Line
+}
+
+# ------------------------------------------------------------------ 菜单
+function Show-Menu {
+    Clear-Host
+    Write-Line
+    Write-Host '   小米互传 -> Windows 11 新版右键菜单' -ForegroundColor White
+    Write-Host '   MiDrop Win11 Context Menu  |  项目: github.com/Bingak/MiDropWin11Menu'
+    Write-Line
+    Write-Host '   想把「使用小米互传发送」放到 Win11 新右键菜单的第一层，' -ForegroundColor DarkGray
+    Write-Host '   不用每次点「显示更多选项」。以下三选一：' -ForegroundColor DarkGray
+    Write-Host ''
+    Write-Host '   [1] 路线 B 安装  ' -NoNewline -ForegroundColor Green
+    Write-Host '推荐。签名安装，不改任何系统全局开关。' -ForegroundColor Gray
+    Write-Host '                   需 Windows SDK（没有的话会提示自动装）。'
+    Write-Host ''
+    Write-Host '   [2] 路线 A 安装  ' -NoNewline -ForegroundColor Cyan
+    Write-Host '免 SDK 免证书，但会开启系统「开发人员模式」。' -ForegroundColor Gray
+    Write-Host ''
+    Write-Host '   [3] 体验一下      ' -NoNewline -ForegroundColor Cyan
+    Write-Host '临时启用，重启电脑后自动失效，不留痕迹。' -ForegroundColor Gray
+    Write-Host '                   想先看看效果选这个。'
+    Write-Host ''
+    Write-Host '   [4] 彻底删除      ' -NoNewline -ForegroundColor Yellow
+    Write-Host '注销包 + 还原开关 + 删掉全部生成的文件。' -ForegroundColor Gray
+    Write-Host ''
+    Write-Host '   [5] 查看当前状态' -ForegroundColor Gray
+    Write-Host '   [0] 退出' -ForegroundColor Gray
+    Write-Line
+
+    $pkg = Get-AppxPackage -Name $PackageName -ErrorAction SilentlyContinue
+    if ($pkg) {
+        Write-Host '   提示：当前已安装，重复安装会先自动卸载旧的。' -ForegroundColor Yellow
+    }
+    Write-Host ''
+}
+
+# ------------------------------------------------------------------ 主流程
+Write-Host '正在检查运行环境 ...' -ForegroundColor DarkGray
+if (-not (Assert-Admin)) { if (-not $NoPause) { Read-Host '按回车退出' }; exit 1 }
+if (-not (Assert-Win11)) { if (-not $NoPause) { Read-Host '按回车退出' }; exit 1 }
+
+while ($true) {
+    Show-Menu
+    $sel = (Read-Host '   请输入序号后回车').Trim()
+    switch ($sel) {
+        '1' { Install-RouteB;  Write-Host ''; Read-Host '按回车返回菜单' }
+        '2' { Install-RouteA $false; Write-Host ''; Read-Host '按回车返回菜单' }
+        '3' { Install-RouteA $true;  Write-Host ''; Read-Host '按回车返回菜单' }
+        '4' { Invoke-FullRemoval;    Write-Host ''; Read-Host '按回车返回菜单' }
+        '5' { Show-Status;           Write-Host ''; Read-Host '按回车返回菜单' }
+        '0' { Write-Host '再见。'; exit 0 }
+        default { Write-Host '   无效输入，请重试。' -ForegroundColor Red; Start-Sleep -Seconds 1 }
+    }
+}

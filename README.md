@@ -24,6 +24,33 @@ MiDropShellExt.dll  ──有 IExplorerCommand、无包标识──▶ 旧菜单
 
 ## 使用方法
 
+### 小白方式：双击「一键安装.cmd」
+
+不想敲命令的话，下载整个仓库后**双击 `一键安装.cmd`** 即可。它会自动请求管理员权限，然后给一个菜单：
+
+```
+   [1] 路线 B 安装   推荐。签名安装，不改任何系统全局开关。
+                    需 Windows SDK（没有的话会提示自动装）。
+
+   [2] 路线 A 安装   免 SDK 免证书，但会开启系统「开发人员模式」。
+
+   [3] 体验一下      临时启用，重启电脑后自动失效，不留痕迹。
+                    想先看看效果选这个。
+
+   [4] 彻底删除      注销包 + 还原开关 + 删掉全部生成的文件。
+
+   [5] 查看当前状态
+   [0] 退出
+```
+
+几点说明：
+
+- **选 [3] 体验**最保险 —— 它只做临时注册，重启电脑后一切自动还原，适合先看看效果。
+- 选 [1] 时若检测到没装 Windows SDK，脚本会问你要不要自动装（推荐装，只装签名工具，体积很小）。
+- `[4] 彻底删除` 会移除包、把「开发人员模式」还原回关闭、删掉自签名证书，并删除 `C:\ProgramData\MiDropWin11Menu`（含之前做的注册表备份）。它**不会**动小米互联服务本身。
+
+以下两节是命令行方式，效果与菜单里的 [1] [2] 完全一致。
+
 ### 路线 B（推荐）：签名安装
 
 签名 `.msix` 走 Windows 默认已启用的旁加载，**不需要开启开发人员模式**，唯一改动是导入一张自签名证书公钥（卸载时会移除）。
@@ -42,7 +69,7 @@ powershell -ExecutionPolicy Bypass -File .\Install-RouteB-SignedMsix.ps1
 
 ### 路线 A（快速）：免 SDK 免证书
 
-前提是需要开启系统「开发人员模式」卸载脚本会自动还原：
+代价是需要开启系统「开发人员模式」（这是唯一的全局开关改动，卸载脚本会自动还原）：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\Install-RouteA-DevMode.ps1 -EnableDeveloperMode
@@ -67,13 +94,17 @@ powershell -ExecutionPolicy Bypass -File .\Uninstall.ps1    # 完整回滚
 
 | 文件 | 说明 |
 |---|---|
+| `一键安装.cmd` | **双击即用**，自动提权，菜单式选择路线 A / B / 体验 / 彻底删除 |
+| `MiDrop-Menu.ps1` | 一键安装的主程序，由上面的 `.cmd` 调起 |
 | `sparse/AppxManifest.xml` | 稀疏包清单，已填好原厂 CLSID `{504d69c0-cb52-48df-b5b5-7161829fabc8}` |
-| `Install-RouteB-SignedMsix.ps1` | 路线 B：签名安装（推荐） |
-| `Install-RouteA-DevMode.ps1` | 路线 A：免 SDK，需开发人员模式 |
+| `Install-RouteB-SignedMsix.ps1` | 路线 B：签名安装（推荐，命令行版） |
+| `Install-RouteA-DevMode.ps1` | 路线 A：免 SDK，需开发人员模式（命令行版） |
 | `Uninstall.ps1` | 回滚：注销包、还原开关、移除证书、校验原厂注册完好 |
 | `Diagnose.ps1` | 只读体检，输出 CLSID / DLL / verb / 包状态 / 开关状态 |
 | `reg/Restore-MiDrop-Original.reg` | 原厂注册状态还原（应急修复用） |
 | `TECHNICAL-NOTES.md` | 实测证据、接口判定、共享内存机制、手工命令 |
+
+> 只要用「一键安装.cmd」，就不需要管下面那几个 `.ps1` —— 它们是完全等价的命令行版本，留着给想自动化或排查问题的人用。
 
 ## 备份与回滚
 

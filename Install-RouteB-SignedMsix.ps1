@@ -63,7 +63,7 @@ function Find-SdkTool([string]$name) {
     foreach ($root in @('C:\Program Files (x86)\Windows Kits\10\bin', 'C:\Program Files\Windows Kits\10\bin')) {
         if (-not (Test-Path $root)) { continue }
         $hit = Get-ChildItem $root -Recurse -Filter $name -ErrorAction SilentlyContinue |
-               Where-Object { $_.DirectoryName -match '\\x64$' } |
+               Where-Object { (Split-Path $_.DirectoryName -Leaf) -ieq 'x64' } |
                Sort-Object FullName -Descending | Select-Object -First 1
         if ($hit) { return $hit.FullName }
     }
