@@ -1,0 +1,26 @@
+# 默认：让 git 自行探测文本文件，但仓库内一律以 LF 存储
+* text=auto
+
+# ---- 必须保持 CRLF（Windows 工具链要求）--------------------------------
+# PowerShell 5.1 在某些区域设置下对 LF-only 脚本的解析不稳定
+*.ps1   text eol=crlf
+*.psm1  text eol=crlf
+*.psd1  text eol=crlf
+*.cmd   text eol=crlf
+*.bat   text eol=crlf
+*.xml   text eol=crlf
+
+# ---- 必须按二进制处理 --------------------------------------------------
+# .reg 是 UTF-16LE 编码。若被当作文本，git 的换行转换与编码探测会破坏
+# BOM 与字节序，导致 regedit 报「不是有效的注册表脚本」。
+*.reg   binary
+
+# 证书与包（正常情况下已被 .gitignore 排除，此处兜底）
+*.pfx   binary
+*.cer   binary
+*.msix  binary
+*.appx  binary
+
+# ---- 语言统计与 diff ---------------------------------------------------
+*.ps1   linguist-language=PowerShell
+*.md    text eol=crlf diff=markdown

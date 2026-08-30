@@ -1,0 +1,65 @@
+# ---- 本项目产物（绝不提交）----------------------------------------------
+# 签名证书：私钥泄露等于把签名能力交给别人
+*.pfx
+*.cer
+*.p12
+*.snk
+signing.*
+
+# 构建出的包
+*.msix
+*.msixbundle
+*.appx
+*.appxbundle
+*.appxsym
+*.appxupload
+
+# 安装脚本在本机生成的暂存 / 备份 / 状态
+install-state.json
+backup/
+stage/
+out/
+
+
+# ---- Windows ------------------------------------------------------------
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+Desktop.ini
+desktop.ini
+$RECYCLE.BIN/
+*.lnk
+*.stackdump
+
+
+# ---- macOS / Linux（跨平台协作时的噪音）--------------------------------
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+*~
+.directory
+
+
+# ---- 编辑器 / IDE -------------------------------------------------------
+.vs/
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+.idea/
+
+
+# ---- 日志与临时文件 -----------------------------------------------------
+*.log
+*.tmp
+*.bak
+*.orig
+*.rej
+*.swp
+*.swo

@@ -1,0 +1,107 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<!--
+  MiDrop Win11 Context Menu - Sparse (identity-only) package manifest
+  ===================================================================
+  用途：为小米互联服务已有的 IExplorerCommand 处理器
+        CLSID {504d69c0-cb52-48df-b5b5-7161829fabc8}  (CMiDropContextMenuExt class)
+        DLL   MiDropShellExt.dll  (x64)
+        补上 Windows 11 新版右键菜单所必需的「包标识 / package identity」。
+
+  本包不含任何二进制文件：
+    Executable / com:Class@Path 均为「相对路径」，
+    在 Add-AppxPackage 时通过 -ExternalLocation 指向
+      C:\Program Files\MI\HyperConnect\<版本>\resources\native-interconnect\win32
+    由系统解析到真实文件。
+
+  注意：Publisher 必须与签名证书 Subject 完全一致（Route B 用）。
+        Route A（-Register 松散文件 + 开发人员模式）不校验签名，Publisher 可保持原样。
+-->
+<Package
+  xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:uap10="http://schemas.microsoft.com/appx/manifest/uap/windows10/10"
+  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+  xmlns:com="http://schemas.microsoft.com/appx/manifest/com/windows10"
+  xmlns:desktop4="http://schemas.microsoft.com/appx/manifest/desktop/windows10/4"
+  xmlns:desktop5="http://schemas.microsoft.com/appx/manifest/desktop/windows10/5"
+  IgnorableNamespaces="uap uap10 rescap com desktop4 desktop5">
+
+  <Identity
+    Name="MiDropWin11MenuShim"
+    Publisher="CN=MiDropWin11MenuShim"
+    Version="1.0.0.0"
+    ProcessorArchitecture="x64" />
+
+  <Properties>
+    <DisplayName>小米互传 · Win11 右键菜单适配</DisplayName>
+    <PublisherDisplayName>MiDropWin11MenuShim</PublisherDisplayName>
+    <Logo>Assets\StoreLogo.png</Logo>
+    <uap10:AllowExternalContent>true</uap10:AllowExternalContent>
+  </Properties>
+
+  <Resources>
+    <Resource Language="zh-cn" />
+  </Resources>
+
+  <Dependencies>
+    <!-- AllowExternalContent 需要 10.0.19041.0+；Win11 新右键菜单需要 10.0.22000.0+ -->
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.22000.0" MaxVersionTested="10.0.26200.0" />
+  </Dependencies>
+
+  <Capabilities>
+    <rescap:Capability Name="runFullTrust" />
+    <rescap:Capability Name="unvirtualizedResources" />
+  </Capabilities>
+
+  <Applications>
+    <Application
+      Id="MiDropShim"
+      Executable="MiPcContinuity.exe"
+      uap10:TrustLevel="mediumIL"
+      uap10:RuntimeBehavior="win32App">
+
+      <uap:VisualElements
+        AppListEntry="none"
+        DisplayName="小米互传 · Win11 右键菜单适配"
+        Description="为小米互传的 IExplorerCommand 处理器提供包标识，使其进入 Windows 11 新版右键菜单第一层。"
+        BackgroundColor="transparent"
+        Square150x150Logo="Assets\Square150x150Logo.png"
+        Square44x44Logo="Assets\Square44x44Logo.png" />
+
+      <Extensions>
+
+        <!-- 1) 把已有的 DLL 声明为「包内 COM 代理服务器」。
+                Id   = 原厂 CLSID，不可改。
+                Path = 相对 -ExternalLocation 的路径。
+                ThreadingModel=STA 对应原注册表里的 Apartment。 -->
+        <com:Extension Category="windows.comServer">
+          <com:ComServer>
+            <com:SurrogateServer DisplayName="MiDrop Context Menu Handler">
+              <com:Class
+                Id="504d69c0-cb52-48df-b5b5-7161829fabc8"
+                Path="MiDropShellExt.dll"
+                ThreadingModel="STA" />
+            </com:SurrogateServer>
+          </com:ComServer>
+        </com:Extension>
+
+        <!-- 2) 把该 CLSID 关联到资源管理器的新版右键菜单。
+                Type="*"         → 任意文件（含多选）
+                Type="Directory" → 选中的文件夹
+                与原厂在 HKLM\SOFTWARE\Classes 下注册的
+                *\shell\MiDropExtMenu 与 Directory\shell\MiDropExtMenu 保持一致。 -->
+        <desktop4:Extension Category="windows.fileExplorerContextMenus">
+          <desktop4:FileExplorerContextMenus>
+            <desktop5:ItemType Type="*">
+              <desktop5:Verb Id="MiDropSendFile" Clsid="504d69c0-cb52-48df-b5b5-7161829fabc8" />
+            </desktop5:ItemType>
+            <desktop5:ItemType Type="Directory">
+              <desktop5:Verb Id="MiDropSendFolder" Clsid="504d69c0-cb52-48df-b5b5-7161829fabc8" />
+            </desktop5:ItemType>
+          </desktop4:FileExplorerContextMenus>
+        </desktop4:Extension>
+
+      </Extensions>
+    </Application>
+  </Applications>
+</Package>
