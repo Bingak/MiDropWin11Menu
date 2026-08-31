@@ -37,6 +37,8 @@ $Clsid       = '{504d69c0-cb52-48df-b5b5-7161829fabc8}'
 $VerbFile    = 'HKLM\SOFTWARE\Classes\*\shell\MiDropExtMenu'
 $VerbDir     = 'HKLM\SOFTWARE\Classes\Directory\shell\MiDropExtMenu'
 $UnlockKey   = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock'
+# 小米组件根目录：用 ProgramFiles 环境变量，避免系统盘不是 C: 时找不到
+$MiRoot      = Join-Path ${env:ProgramFiles} 'MI\HyperConnect'
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 if ($PSCommandPath) { $ScriptDir = Split-Path -Parent $PSCommandPath }
@@ -77,9 +79,9 @@ function Assert-Win11 {
 
 # 定位小米组件目录（自动挑最高版本）
 function Get-MiDropDir {
-    $root = Join-Path ${env:ProgramFiles} 'MI\HyperConnect'
-    if (-not (Test-Path -LiteralPath $root)) { return $null }
-    $hit = Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+    if (-not (Test-Path -LiteralPath $MiRoot)) { return $null }
+    # @() 包裹：只有单个版本时管道会返回标量，下标/Count 行为不一致
+    $hit = @(Get-ChildItem -LiteralPath $MiRoot -Directory -ErrorAction SilentlyContinue | ForEach-Object {
         $dll = Join-Path $_.FullName 'resources\native-interconnect\win32\MiDropShellExt.dll'
         $exe = Join-Path $_.FullName 'resources\native-interconnect\win32\MiPcContinuity.exe'
         if ((Test-Path -LiteralPath $dll) -and (Test-Path -LiteralPath $exe)) {
@@ -87,8 +89,8 @@ function Get-MiDropDir {
             try { $v = [version]$_.Name } catch { }
             [pscustomobject]@{ Version = $v; Win32 = Split-Path $dll -Parent; Dll = $dll; DirName = $_.Name }
         }
-    } | Sort-Object Version -Descending
-    if (-not $hit) { return $null }
+    } | Sort-Object Version -Descending)
+    if ($hit.Count -eq 0) { return $null }
     return $hit[0]
 }
 
@@ -194,12 +196,28 @@ function Remove-Package {
     if ($pkgs.Count -eq 0) { return $true }
     foreach ($p in $pkgs) { Remove-AppxPackage -Package $p.PackageFullName -ErrorAction SilentlyContinue }
     Start-Sleep -Seconds 1
+    # 若包被注册到「所有用户」，当前用户的 Remove-AppxPackage 会失败，补一次 -AllUsers
+    $left = @(Get-AppxPackage -Name $PackageName -ErrorAction SilentlyContinue)
+    if ($left.Count -gt 0) {
+        foreach ($p in $left) { Remove-AppxPackage -Package $p.PackageFullName -AllUsers -ErrorAction SilentlyContinue }
+        Start-Sleep -Seconds 1
+    }
     return (@(Get-AppxPackage -Name $PackageName -ErrorAction SilentlyContinue).Count -eq 0)
 }
 
 function Find-SdkTool([string]$name) {
-    foreach ($root in @("${env:ProgramFiles(x86)}\Windows Kits\10\bin", "$env:ProgramFiles\Windows Kits\10\bin")) {
-        if (-not (Test-Path $root)) { continue }
+    # 1) 优先用 SDK 自己导出的环境变量（最准确，也免去全盘扫描）
+    #    WindowsSdkVerBinPath 形如 ...\Windows Kits\10\bin\10.0.26100.0\x64\
+    if ($env:WindowsSdkVerBinPath) {
+        $p = Join-Path $env:WindowsSdkVerBinPath $name
+        if (Test-Path -LiteralPath $p) { return $p }
+    }
+    $binRoots = @()
+    if ($env:WindowsSdkBinPath) { $binRoots += $env:WindowsSdkBinPath }
+    $binRoots += @("${env:ProgramFiles(x86)}\Windows Kits\10\bin", "$env:ProgramFiles\Windows Kits\10\bin")
+
+    foreach ($root in $binRoots) {
+        if (-not $root -or -not (Test-Path -LiteralPath $root)) { continue }
         # 按真实版本号降序（目录名字符串排序会把 10.0.9900 错排到 10.0.26100 前面）
         $dirs = Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue | ForEach-Object {
             $v = $null
@@ -261,11 +279,109 @@ function Remove-Sdk26100 {
 function Restart-ExplorerNow {
     Info '正在重启资源管理器，右键菜单即将刷新 ...'
     Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
-    Start-Sleep -Seconds 2
+    # 轮询等系统自动拉起（AutoRestartShell），最多 15 秒。
+    # 原先固定 sleep 2 秒再判断：系统拉起稍慢就会重复启动一个 explorer，
+    # 或在尚未拉起时就误判为「已存在」而什么都不做。
+    $deadline = (Get-Date).AddSeconds(15)
+    while ((Get-Date) -lt $deadline) {
+        if (Get-Process -Name explorer -ErrorAction SilentlyContinue) { break }
+        Start-Sleep -Milliseconds 500
+    }
     if (-not (Get-Process -Name explorer -ErrorAction SilentlyContinue)) {
         Start-Process explorer.exe | Out-Null
     }
     Ok '资源管理器已重启。'
+}
+
+# 校验原厂注册（即「显示更多选项」里的入口）是否完好。
+# 本方案对 HKLM\SOFTWARE\Classes 只读，这里用于安装后自检与卸载后复核。
+# 返回异常项路径数组；正常时为空数组。
+function Test-FactoryRegistration {
+    $bad = @()
+    $must = @(
+        @{ Path = "$RegKey\CLSID\$Clsid\InprocServer32"; Name = '(default)';              Expect = 'MiDropShellExt.dll' },
+        @{ Path = "$RegKey\*\shell\MiDropExtMenu";        Name = 'ExplorerCommandHandler'; Expect = $Clsid },
+        @{ Path = "$RegKey\Directory\shell\MiDropExtMenu"; Name = 'ExplorerCommandHandler'; Expect = $Clsid }
+    )
+    foreach ($m in $must) {
+        if (-not (Test-Path -LiteralPath $m.Path)) { $bad += $m.Path; continue }
+        $v = Get-ItemProperty -LiteralPath $m.Path -ErrorAction SilentlyContinue
+        $val = if ($null -eq $v) { '' } elseif ($m.Name -eq '(default)') { $v.'(default)' } else { $v.($m.Name) }
+        if ([string]::IsNullOrWhiteSpace([string]$val) -or ($val -notlike "*$($m.Expect)*")) { $bad += $m.Path }
+    }
+    return ,$bad
+}
+
+# 安装前的公共准备：定位组件 → 校验原厂注册 → 备份 → 铺设稀疏包目录。
+# 任一步失败返回 $null（已打印原因），成功返回组件信息对象。
+function Get-InstallContext {
+    $mi = Get-MiDropDir
+    if (-not $mi) { Err '未找到小米互联服务的组件目录，请先安装小米互联服务。'; return $null }
+    Ok "组件目录：$($mi.Win32)（版本 $($mi.DirName)）"
+
+    if (-not (Test-Path -LiteralPath "$RegKey\CLSID\$Clsid\InprocServer32")) {
+        Err '原厂右键注册不存在，请先修复或重装小米互联服务。'
+        return $null
+    }
+
+    Info '备份原厂注册表 ...'
+    if (Backup-Registry) { Ok "备份已保存到 $BackupRoot" } else { Warn '部分备份未成功（不影响安装）。' }
+
+    if (-not (Install-Stage $mi.Win32)) { return $null }
+    return $mi
+}
+
+# 确保 makeappx / signtool 可用（路线 B 前置）。
+# 返回 @{ MakeAppx=..; SignTool=.. }，或 @{ FallbackToA=$true }（用户改选路线 A），
+# 或 $null（用户取消 / 安装失败）。
+function Ensure-SdkTools {
+    $makeappx = Find-SdkTool 'makeappx.exe'
+    $signtool = Find-SdkTool 'signtool.exe'
+    if ($makeappx -and $signtool) { return @{ MakeAppx = $makeappx; SignTool = $signtool } }
+
+    Warn '未检测到 Windows SDK 的签名工具（MakeAppx.exe / SignTool.exe）。'
+    Warn '路线 B 需要它。你可以：'
+    Write-Host '   a) 现在自动安装（约需几分钟,大约占用3G空间）'
+    Write-Host '   b) 改用路线 A（免 SDK，但要开「开发人员模式」）'
+    Write-Host '   c) 返回主菜单'
+    $c = (Read-Host '   请选择 a/b/c').Trim().ToLower()
+    if ($c -eq 'b') { return @{ FallbackToA = $true } }
+    if ($c -ne 'a') { return $null }
+
+    if (-not (Get-Command winget.exe -ErrorAction SilentlyContinue)) {
+        Err '未检测到 winget，无法自动安装。请手动安装 Windows SDK 或改用路线 A。'
+        return $null
+    }
+    Info '正在通过 winget 安装 Windows SDK，请稍候 ...'
+    winget install --id Microsoft.WindowsSDK.10.0.26100 --accept-package-agreements --accept-source-agreements
+    if ($LASTEXITCODE -ne 0) {
+        Err "winget 安装失败，退出码 $LASTEXITCODE。可稍后重试或改用路线 A。"
+        return $null
+    }
+    $script:SdkInstalledByUs = $true
+    $makeappx = Find-SdkTool 'makeappx.exe'
+    $signtool = Find-SdkTool 'signtool.exe'
+    if (-not $makeappx -or -not $signtool) {
+        Err '安装后仍未找到工具。请重新打开本窗口再试，或改用路线 A。'
+        return $null
+    }
+    Ok 'SDK 已就绪（卸载本工具时会提示是否一并移除它）。'
+    return @{ MakeAppx = $makeappx; SignTool = $signtool }
+}
+
+# 安装收尾：提示先测单文件，并自检原厂注册未被影响
+function Write-PostInstallAdvice {
+    Write-Host ''
+    Warn '请务必先右键【单个文件】测试：互传窗口弹出且能看到该文件才算成功。'
+    Warn '若窗口弹出但列表为空，说明本方案在你的环境不可用，请按 [4] 彻底删除。'
+    $bad = Test-FactoryRegistration
+    if ($bad.Count -eq 0) {
+        Ok '自检通过：原厂注册完好，「显示更多选项」里的入口不受影响。'
+    }
+    else {
+        Warn '自检发现原厂注册异常（本方案不修改这些键，请检查小米互联服务是否正常）：'
+        $bad | ForEach-Object { Warn "    $_" }
+    }
 }
 
 function Save-State([hashtable]$data) {
@@ -309,7 +425,7 @@ function Invoke-RegisterPackage([string]$Win32Dir, [string]$Route, [bool]$DevMod
 
 function Install-RouteA([bool]$Trial) {
     Write-Line
-    Write-Host ('  ' + $(if ($Trial) { '体验模式（路线 A，重启后自动失效）' } else { '路线 A 安装' })) -ForegroundColor Cyan
+    Write-Host ('  ' + $(if ($Trial) { '体验模式（路线 A，回车确认后自动还原）' } else { '路线 A 安装' })) -ForegroundColor Cyan
     Write-Line
 
     if (-not $Trial) {
@@ -318,19 +434,8 @@ function Install-RouteA([bool]$Trial) {
         Write-Host ''
     }
 
-    $mi = Get-MiDropDir
-    if (-not $mi) { Err '未找到小米互联服务的组件目录，请先安装小米互联服务。'; return }
-    Ok "组件目录：$($mi.Win32)（版本 $($mi.DirName)）"
-
-    if (-not (Test-Path -LiteralPath "$RegKey\CLSID\$Clsid\InprocServer32")) {
-        Err '原厂右键注册不存在，请先修复或重装小米互联服务。'
-        return
-    }
-
-    Info '备份原厂注册表 ...'
-    if (Backup-Registry) { Ok "备份已保存到 $BackupRoot" } else { Warn '部分备份未成功（不影响安装）。' }
-
-    if (-not (Install-Stage $mi.Win32)) { return }
+    $mi = Get-InstallContext
+    if (-not $mi) { return }
 
     # 开发人员模式
     $devOn = $false
@@ -375,10 +480,8 @@ function Install-RouteA([bool]$Trial) {
         Write-Host ''
         Ok '安装完成！请右键任意文件或文件夹查看效果。'
         Warn '若未出现，请注销重登一次再试。'
+        Write-PostInstallAdvice
     }
-    Write-Host ''
-    Warn '请务必先右键【单个文件】测试：互传窗口弹出且能看到该文件才算成功。'
-    Warn '若窗口弹出但列表为空，说明本方案在你的环境不可用，请按 [4] 彻底删除。'
 }
 
 function Install-RouteB {
@@ -386,52 +489,12 @@ function Install-RouteB {
     Write-Host '  路线 B 安装（签名 .msix，不改系统全局开关）[推荐]' -ForegroundColor Cyan
     Write-Line
 
-    $mi = Get-MiDropDir
-    if (-not $mi) { Err '未找到小米互联服务的组件目录，请先安装小米互联服务。'; return }
-    Ok "组件目录：$($mi.Win32)（版本 $($mi.DirName)）"
+    $sdk = Ensure-SdkTools
+    if (-not $sdk) { return }
+    if ($sdk.FallbackToA) { Install-RouteA $false; return }
 
-    $makeappx = Find-SdkTool 'makeappx.exe'
-    $signtool = Find-SdkTool 'signtool.exe'
-    if (-not $makeappx -or -not $signtool) {
-        Warn '未检测到 Windows SDK 的签名工具（MakeAppx.exe / SignTool.exe）。'
-        Warn '路线 B 需要它。你可以：'
-        Write-Host '   a) 现在自动安装（推荐，体积很小，约需几分钟）'
-        Write-Host '   b) 改用路线 A（免 SDK，但要开「开发人员模式」）'
-        Write-Host '   c) 返回主菜单'
-        $c = (Read-Host '   请选择 a/b/c').Trim().ToLower()
-        if ($c -eq 'a') {
-            if (-not (Get-Command winget.exe -ErrorAction SilentlyContinue)) {
-                Err '未检测到 winget，无法自动安装。请手动安装 Windows SDK 或改用路线 A。'
-                return
-            }
-            Info '正在通过 winget 安装 Windows SDK，请稍候 ...'
-            winget install --id Microsoft.WindowsSDK.10.0.26100 --accept-package-agreements --accept-source-agreements
-            if ($LASTEXITCODE -ne 0) {
-                Err "winget 安装失败，退出码 $LASTEXITCODE。可稍后重试或改用路线 A。"
-                return
-            }
-            $script:SdkInstalledByUs = $true
-            $makeappx = Find-SdkTool 'makeappx.exe'
-            $signtool = Find-SdkTool 'signtool.exe'
-            if (-not $makeappx -or -not $signtool) {
-                Err '安装后仍未找到工具。请重新打开本窗口再试，或改用路线 A。'
-                return
-            }
-            Ok 'SDK 已就绪（卸载本工具时会提示是否一并移除它）。'
-        }
-        elseif ($c -eq 'b') { Install-RouteA $false; return }
-        else { return }
-    }
-
-    if (-not (Test-Path -LiteralPath "$RegKey\CLSID\$Clsid\InprocServer32")) {
-        Err '原厂右键注册不存在，请先修复或重装小米互联服务。'
-        return
-    }
-
-    Info '备份原厂注册表 ...'
-    if (Backup-Registry) { Ok "备份已保存到 $BackupRoot" } else { Warn '部分备份未成功（不影响安装）。' }
-
-    if (-not (Install-Stage $mi.Win32)) { return }
+    $mi = Get-InstallContext
+    if (-not $mi) { return }
 
     # 自签名证书
     Info '准备签名证书 ...'
@@ -460,9 +523,9 @@ function Install-RouteB {
 
     # 打包 + 签名
     Info '打包并签名 .msix ...'
-    & $makeappx pack /o /d $StageSparse /nv /p $MsixPath 2>&1 | Out-Null
+    & $sdk.MakeAppx pack /o /d $StageSparse /nv /p $MsixPath 2>&1 | Out-Null
     if ($LASTEXITCODE -ne 0) { Err "MakeAppx 打包失败，退出码 $LASTEXITCODE"; Remove-Item -LiteralPath $pfx -Force -ErrorAction SilentlyContinue; return }
-    & $signtool sign /fd SHA256 /f $pfx /p $pwdPlain $MsixPath 2>&1 | Out-Null
+    & $sdk.SignTool sign /fd SHA256 /f $pfx /p $pwdPlain $MsixPath 2>&1 | Out-Null
     Remove-Item -LiteralPath $pfx -Force -ErrorAction SilentlyContinue
     if ($LASTEXITCODE -ne 0) { Err "SignTool 签名失败，退出码 $LASTEXITCODE"; return }
     Ok '签名完成，私钥文件已销毁。'
@@ -474,15 +537,13 @@ function Install-RouteB {
     Write-Host ''
     Ok '安装完成！请右键任意文件或文件夹查看效果。'
     Warn '若未出现，请注销重登一次再试。'
-    Write-Host ''
-    Warn '请务必先右键【单个文件】测试：互传窗口弹出且能看到该文件才算成功。'
-    Warn '若窗口弹出但列表为空，说明本方案在你的环境不可用，请按 [4] 彻底删除。'
+    Write-PostInstallAdvice
 }
 
 # ------------------------------------------------------------------ 彻底删除
 function Invoke-FullRemoval {
     Write-Line
-    Write-Host '  彻底删除（注销 + 还原开关 + 移除证书 + 删除全部生成文件）' -ForegroundColor Cyan
+    Write-Host '  彻底删除（注销 + 还原开关 + 移除证书 + 卸载自动装的 SDK + 清理生成文件）' -ForegroundColor Cyan
     Write-Line
 
     $state = $null
@@ -572,20 +633,12 @@ function Invoke-FullRemoval {
 
     Write-Host ''
     Info '检查原厂右键注册是否完好 ...'
-    $bad = @()
-    $mustExist = @(
-        "$RegKey\CLSID\$Clsid\InprocServer32",
-        "$RegKey\*\shell\MiDropExtMenu",
-        "$RegKey\Directory\shell\MiDropExtMenu"
-    )
-    foreach ($p in $mustExist) {
-        if (-not (Test-Path -LiteralPath $p)) { $bad += $p }
-    }
+    $bad = Test-FactoryRegistration   # 值级校验（含 DLL 路径与 CLSID 比对）
     if ($bad.Count -eq 0) {
         Ok '原厂注册完好：「显示更多选项」里的入口不受影响。'
     }
     else {
-        Warn '以下原厂注册缺失（本方案不会删除它们，可能是其他原因）：'
+        Warn '以下原厂注册缺失或值异常（本方案不会删除它们，可能是其他原因）：'
         $bad | ForEach-Object { Warn "    $_" }
         Warn '可用同目录下 reg\Restore-MiDrop-Original.reg 修复（用 64 位 regedit 导入）。'
     }
@@ -598,6 +651,12 @@ function Show-Status {
     Write-Line
     Write-Host '  当前状态' -ForegroundColor Cyan
     Write-Line
+
+    # 状态文件：解析失败不能影响后续展示，置为 $null 即可
+    $state = $null
+    if (Test-Path -LiteralPath $StateFile) {
+        try { $state = Get-Content -LiteralPath $StateFile -Raw -ErrorAction Stop | ConvertFrom-Json } catch { $state = $null }
+    }
 
     $cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
     $arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'AMD64') { '64 位' } else { $env:PROCESSOR_ARCHITECTURE }
@@ -618,12 +677,12 @@ function Show-Status {
         Write-Host '  右键菜单包         ' -NoNewline -ForegroundColor Gray; Write-Host '已安装' -ForegroundColor Green
         Write-Host '  注册方式           ' -NoNewline -ForegroundColor Gray; Write-Host "$($pkg.SignatureKind) / $($pkg.PackageFullName)"
         Write-Host '  外部位置           ' -NoNewline -ForegroundColor Gray
-        if ($state = (Get-Content -LiteralPath $StateFile -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json)) {
+        if ($state) {
             $ext = $state.ExternalLocation
             if ($ext -and (Test-Path -LiteralPath $ext)) { Write-Host "$ext （有效）" -ForegroundColor Green }
             else { Write-Host "$ext （已失效，组件可能已升级，请重新安装）" -ForegroundColor Red }
         }
-        else { Write-Host '状态文件缺失' -ForegroundColor Yellow }
+        else { Write-Host '状态文件缺失或已损坏' -ForegroundColor Yellow }
     }
     else {
         Write-Host '  右键菜单包         ' -NoNewline -ForegroundColor Gray; Write-Host '未安装' -ForegroundColor Yellow
@@ -641,6 +700,13 @@ function Show-Status {
     $mk = Find-SdkTool 'makeappx.exe'
     Write-Host '  Windows SDK 工具   ' -NoNewline -ForegroundColor Gray
     Write-Host $(if ($mk) { '已安装' } else { '未安装（路线 B 需要）' }) -ForegroundColor $(if ($mk) { 'Green' } else { 'Yellow' })
+
+    $sdkInstalled = Test-Sdk26100Installed
+    Write-Host '  Windows SDK 包     ' -NoNewline -ForegroundColor Gray
+    $sdkNote = if (-not $sdkInstalled) { '未安装' }
+               elseif ($state -and $state.SdkInstalledByUs -eq $true) { '已安装（由本脚本安装，卸载时会移除）' }
+               else { '已安装（非本脚本安装，卸载时会询问）' }
+    Write-Host $sdkNote -ForegroundColor $(if ($sdkInstalled) { 'Green' } else { 'Gray' })
 
     $old = Test-Path -LiteralPath 'HKCU:\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}'
     Write-Host '  旧菜单全局回退     ' -NoNewline -ForegroundColor Gray
@@ -673,7 +739,7 @@ function Show-Menu {
     Write-Host '                   想先看看效果选这个。'
     Write-Host ''
     Write-Host '   [4] 彻底删除      ' -NoNewline -ForegroundColor Yellow
-    Write-Host '注销包 + 还原开关 + 删掉全部生成的文件。' -ForegroundColor Gray
+    Write-Host '注销包 + 还原开关 + 卸载自动装的 SDK + 删掉生成的文件。' -ForegroundColor Gray
     Write-Host ''
     Write-Host '   [5] 查看当前状态' -ForegroundColor Gray
     Write-Host '   [0] 退出' -ForegroundColor Gray
