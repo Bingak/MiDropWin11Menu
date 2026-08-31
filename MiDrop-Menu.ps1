@@ -18,12 +18,15 @@
    [1] 路线 B 安装  —— 签名 .msix，不改任何系统全局开关     
    [2] 路线 A 安装  —— 推荐。免 SDK 免证书，但会开启「开发人员模式」
    [3] 体验一下      —— 注册后立即测试，回车确认后自动注销还原
-   [4] 彻底删除      —— 注销包 + 还原开关 + 移除证书 + 卸载 SDK + 删生成文件
+   [4] 彻底删除      —— 注销包 + 还原开关 + 移除证书 + 卸载 SDK + 清理注册表残留 + 删生成文件
    [5] 查看当前状态
    [0] 退出
 
  设计原则
    - 对 HKLM\SOFTWARE\Classes 下的原厂键值只读，绝不修改 → 旧菜单入口永不受影响。
+     卸载时的注册表清理【只针对非原厂来源】的 MiDropExtMenu 键（Handler ≠ 小米 CLSID）；
+     原厂入口（Handler = {504d69c0-...}）一律保留不删。清理前必定先导出 .reg 备份，
+     删后强制保留备份目录以便回滚。
    - 任何会改变系统状态的动作都尽量带容错；安全中心改动必走 try/finally 还原。
    - 组件目录自动挑选最高版本，系统盘不是 C: 时也能通过环境变量定位。
 ================================================================================
@@ -347,6 +350,142 @@ function Test-FactoryRegistration {
         if ([string]::IsNullOrWhiteSpace([string]$val) -or ($val -notlike "*$($m.Expect)*")) { $bad += $m.Path }
     }
     return $bad
+}
+
+# ------------------------------------------------------------------ 注册表残留搜索与清理
+<#
+ Find-MiDropRegVerbs
+   全量搜索注册表里所有名为 MiDropExtMenu 的键（shell 动词挂载点）。
+
+   重要：HKEY_CLASSES_ROOT(HKCR) 并不是独立的物理键，而是
+   HKLM\SOFTWARE\Classes 与 HKCU\Software\Classes 的【合并视图】。
+   所以 regedit 里 HKCR 与 HKLM 下看似 4 条，实际通常只有 2 个物理键。
+   本函数只搜索真实物理位置，避免把同一份数据重复计数、重复删除：
+     - HKLM\SOFTWARE\Classes            （64 位机器级，原厂通常注册在这里）
+     - HKCU\Software\Classes            （用户级）
+     - HKLM\SOFTWARE\WOW6432Node\Classes（32 位视图）
+
+   返回对象数组，每项含：Hive / Path（展示用完整路径）/ Root+SubPath（删除用）/ Handler。
+   Handler 为 ExplorerCommandHandler 的值，用于确认归属，避免误删同名但无关的键。
+#>
+function Find-MiDropRegVerbs {
+    [CmdletBinding()]
+    param([int]$MaxDepth = 6)
+
+    $hives = @(
+        [pscustomobject]@{ Root = [Microsoft.Win32.Registry]::LocalMachine; Base = 'SOFTWARE\Classes';             Display = 'HKLM:\SOFTWARE\Classes';             Prefix = 'HKLM' },
+        [pscustomobject]@{ Root = [Microsoft.Win32.Registry]::CurrentUser;  Base = 'Software\Classes';              Display = 'HKCU:\Software\Classes';             Prefix = 'HKCU' },
+        [pscustomobject]@{ Root = [Microsoft.Win32.Registry]::LocalMachine; Base = 'SOFTWARE\WOW6432Node\Classes';  Display = 'HKLM:\SOFTWARE\WOW6432Node\Classes'; Prefix = 'HKLM' }
+    )
+    $found = New-Object System.Collections.Generic.List[object]
+
+    # 递归遍历。命中目标名后不再深入其内部（后续是整树删除，无需再枚举子键，也省时间）
+    function Walk($root, [string]$sub, [string]$basePath, [string]$display, [string]$prefix, [int]$depth) {
+        if ($depth -gt $MaxDepth) { return }
+        $key = $null
+        try { $key = $root.OpenSubKey($sub) } catch { return }
+        if (-not $key) { return }
+        foreach ($n in $key.GetSubKeyNames()) {
+            $child = if ($sub) { "$sub\$n" } else { $n }
+            if ($n -eq 'MiDropExtMenu') {
+                $handler = ''
+                try {
+                    $vk = $root.OpenSubKey($child)
+                    if ($vk) { $handler = [string]$vk.GetValue('ExplorerCommandHandler'); $vk.Dispose() }
+                } catch { }
+                $rel = if ($child.Length -gt $basePath.Length) { $child.Substring($basePath.Length).TrimStart('\') } else { $child }
+                $found.Add([pscustomobject]@{
+                    Hive       = $display
+                    Root       = $root
+                    SubPath    = $child
+                    Path       = "$display\$rel"
+                    RegPath    = "$prefix\$child"        # 供 Export-RegKeyPS 使用
+                    Handler    = $handler
+                    # 归属判定：Handler 严格等于小米 CLSID 才算原厂入口，其余一律视为非原厂
+                    IsFactory  = ($handler -eq $script:Clsid)
+                })
+                continue
+            }
+            Walk $root $child $basePath $display $prefix ($depth + 1)
+        }
+        $key.Dispose()
+    }
+
+    foreach ($h in $hives) { Walk $h.Root $h.Base $h.Base $h.Display $h.Prefix 0 }
+    return $found.ToArray()
+}
+
+<#
+ Remove-MiDropRegVerbs
+   删除 Find-MiDropRegVerbs 找到的注册表键（整树删除，含其下所有子键与值）。
+
+   【原厂保护（默认行为）】
+   只删除 IsFactory = $false 的键，即 ExplorerCommandHandler 不等于小米 CLSID 的键。
+   原厂入口（Handler = {504d69c0-...}）默认一律跳过、绝不删除，
+   保证「显示更多选项」里的「使用小米互传发送」始终不受影响。
+   只有显式加 -IncludeFactory 才会连原厂键一起删（一般不需要，也不建议）。
+
+   安全措施：
+   - 删除前先用 Export-RegKeyPS 把每个键导出成 .reg 存到 backup 目录，可随时导入回滚；
+   - 用 .NET 的 DeleteSubKeyTree 删除，而不是 Remove-Item —— 后者遇到路径里的「*」
+     会触发通配符/视图问题（实测 PowerShell 对 HKCR:\*\shell\... 的 Test-Path 会假阴性）；
+   - 逐项容错，单个失败不影响其余。
+
+   返回 @{ Removed; BackupFiles; SkippedFactory }。
+#>
+function Remove-MiDropRegVerbs {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [object[]]$Verbs,
+        [switch]$BackupFirst,
+        [switch]$IncludeFactory
+    )
+
+    # 默认只清理「非原厂」键；原厂入口受保护，除非显式加 -IncludeFactory
+    $targets = @($Verbs | Where-Object { $IncludeFactory -or -not $_.IsFactory })
+    if ($targets.Count -eq 0) {
+        return @{ Removed = 0; BackupFiles = @(); SkippedFactory = @($Verbs | Where-Object { $_.IsFactory }).Count }
+    }
+
+    $removed   = 0
+    $savedRegs = @()
+
+    if ($BackupFirst) {
+        if (-not (Test-Path -LiteralPath $script:BackupRoot)) {
+            New-Item -ItemType Directory -Path $script:BackupRoot -Force | Out-Null
+        }
+    }
+
+    foreach ($v in $targets) {
+        # 1) 删除前导出备份
+        if ($BackupFirst) {
+            $safe = ($v.Path -replace '[\\:*?"<>|]', '_')
+            $dest = Join-Path $script:BackupRoot ("PurgeVerbs-$safe-$(Get-Date -Format 'yyyyMMdd-HHmmss').reg")
+            if (Export-RegKeyPS -RootKey $v.RegPath -DestFile $dest) {
+                $savedRegs += $dest
+            }
+            else { Warn "导出备份失败，跳过删除以保证可回滚：$($v.Path)"; continue }
+        }
+
+        # 2) 用 .NET 删除：打开父键（可写）→ DeleteSubKeyTree
+        try {
+            $idx    = $v.SubPath.LastIndexOf('\')
+            $parent = $v.SubPath.Substring(0, $idx)
+            $leaf   = $v.SubPath.Substring($idx + 1)
+            $pk = $v.Root.OpenSubKey($parent, $true)   # writable = true
+            if (-not $pk) { Warn "无法打开父键（可能无权限）：$($v.Path)"; continue }
+            try { $pk.DeleteSubKeyTree($leaf) } finally { $pk.Dispose() }
+            $removed++
+            Ok "已删除：$($v.Path)"
+        }
+        catch {
+            Warn "删除失败：$($v.Path)"
+            Warn "  原因：$($_.Exception.Message)"
+        }
+    }
+    $skipped = if ($IncludeFactory) { 0 } else { @($Verbs | Where-Object { $_.IsFactory }).Count }
+    return @{ Removed = $removed; BackupFiles = $savedRegs; SkippedFactory = $skipped }
 }
 
 # 安装前的公共准备：定位组件 → 校验原厂注册 → 备份 → 铺设稀疏包目录。
@@ -680,8 +819,15 @@ function Invoke-InstallRouteB {
 # ------------------------------------------------------------------ 彻底删除
 function Invoke-Uninstall {
     [CmdletBinding()]
-    param([switch]$KeepBackup, [switch]$KeepDeveloperMode, [switch]$KeepSdk, [switch]$NoRestartExplorer)
-    Write-SectionHeader '彻底删除（注销 + 还原开关 + 移除证书 + 卸载自动装的 SDK + 清理生成文件）'
+    param(
+        [switch]$KeepBackup,
+        [switch]$KeepDeveloperMode,
+        [switch]$KeepSdk,
+        [switch]$NoRestartExplorer,
+        [switch]$PurgeRegistryVerbs,
+        [switch]$KeepRegistryVerbs
+    )
+    Write-SectionHeader '彻底删除（注销 + 还原开关 + 移除证书 + 卸载 SDK + 清理注册表残留 + 清理生成文件）'
 
     $state = $null
     if (Test-Path -LiteralPath $script:StateFile) {
@@ -693,19 +839,27 @@ function Invoke-Uninstall {
     Write-Host '    2. 还原「开发人员模式」开关（若当初由本脚本开启）'
     Write-Host '    3. 移除自签名证书'
     Write-Host '    4. 卸载本脚本自动安装的 Windows SDK 10.0.26100（若有）'
-    Write-Host '    5. 删除 C:\ProgramData\MiDropWin11Menu'
+    Write-Host '    5. 搜索注册表 MiDropExtMenu 残留，只清理【非原厂】来源的键'
+    if ($PurgeRegistryVerbs) { Write-Host '       （-PurgeRegistryVerbs：确认清理非原厂残留，不再询问）' -ForegroundColor Yellow }
+    elseif ($KeepRegistryVerbs) { Write-Host '       （-KeepRegistryVerbs：跳过，既不搜索也不删除）' -ForegroundColor DarkGray }
+    else { Write-Host '       （默认：搜索后询问；原厂入口一律保留不删）' -ForegroundColor DarkGray }
+    Write-Host '    6. 删除 C:\ProgramData\MiDropWin11Menu'
     if ($KeepBackup) { Write-Host '       （-KeepBackup：保留注册表备份子目录）' -ForegroundColor Yellow }
     else { Write-Host '       （含注册表备份；加 -KeepBackup 可保留）' -ForegroundColor DarkGray }
-    Write-Host '  不会动小米互联服务本身及其原厂右键注册。'
+    Write-Host '  不会动小米互联服务的程序文件。'
+    Write-Host ''
+    Write-Host '  说明：注册表清理只针对【非原厂】来源的 MiDropExtMenu 键；' -ForegroundColor Green
+    Write-Host '        小米原厂入口（Handler = {504d69c0-...}）一律保留不删，' -ForegroundColor Green
+    Write-Host '        「显示更多选项」里的「使用小米互传发送」始终可用。' -ForegroundColor Green
     Write-Host ''
     $c = (Read-Host '  确认删除？输入 y 继续，其它取消').Trim().ToLower()
     if ($c -ne 'y') { Info '已取消。'; return }
 
     Write-Host ''
-    Info '1/5 注销包 ...'
+    Info '1/6 注销包 ...'
     if (Remove-Package) { Ok '已注销（或本就未安装）。' } else { Warn '包可能仍被占用，请注销重登后重试一次。' }
 
-    Info '2/5 还原「开发人员模式」...'
+    Info '2/6 还原「开发人员模式」...'
     if ($state -and $state.DevModeChangedByUs -eq $true) {
         if (-not $KeepDeveloperMode -and (Test-Path $script:UnlockKey)) {
             Set-ItemProperty -Path $script:UnlockKey -Name 'AllowDevelopmentWithoutDevLicense' -Value 0 -Type DWord -Force
@@ -722,7 +876,7 @@ function Invoke-Uninstall {
         else { Info '保持原状。' }
     }
 
-    Info '3/5 移除证书 ...'
+    Info '3/6 移除证书 ...'
     $n = 0
     foreach ($c2 in @(Get-ChildItem Cert:\LocalMachine\TrustedPeople -ErrorAction SilentlyContinue | Where-Object { $_.Subject -eq $script:CertSubject })) {
         Remove-Item -LiteralPath $c2.PSPath -Force -ErrorAction SilentlyContinue; $n++
@@ -732,7 +886,7 @@ function Invoke-Uninstall {
     }
     Ok "已移除 $n 张证书。"
 
-    Info '4/5 移除 Windows SDK（若由本脚本自动安装）...'
+    Info '4/6 移除 Windows SDK（若由本脚本自动安装）...'
     if (-not $KeepSdk) {
         if ($state -and $state.SdkInstalledByUs -eq $true) {
             Remove-Sdk26100
@@ -747,11 +901,75 @@ function Invoke-Uninstall {
     }
     else { Info '按要求保留 Windows SDK。' }
 
-    Info '5/5 清理生成文件 ...'
-    # 先显式处理注册表备份目录：默认删除；加 -KeepBackup 则保留。
+    Info '5/6 搜索并清理注册表里的 MiDropExtMenu 残留 ...'
+    $purgeKeptBackup = $false
+    if ($KeepRegistryVerbs) {
+        Info '已指定 -KeepRegistryVerbs，跳过注册表搜索与清理。'
+    }
+    else {
+        Info '正在全量搜索（HKLM\SOFTWARE\Classes / HKCU\Software\Classes / WOW6432Node\Classes）...'
+        $verbs = @(Find-MiDropRegVerbs)
+        if ($verbs.Count -eq 0) {
+            Ok '未找到任何 MiDropExtMenu 注册表键，无需清理。'
+        }
+        else {
+            # 分类：原厂入口（Handler 严格等于小米 CLSID） vs 其它来源（可能是残留）
+            $factory = @($verbs | Where-Object { $_.IsFactory })
+            $others  = @($verbs | Where-Object { -not $_.IsFactory })
+
+            Write-Host "    共找到 $($verbs.Count) 个 MiDropExtMenu 键：" -ForegroundColor Yellow
+            foreach ($v in $verbs) {
+                Write-Host "      - $($v.Path)"
+                Write-Host ("          Handler = {0}{1}" -f $v.Handler, $(if ($v.IsFactory) { '   ← 小米原厂入口（保留）' } else { '   ← 非原厂来源' }))
+            }
+            Write-Host ''
+
+            # 原厂入口一律保护，绝不删除
+            if ($factory.Count -gt 0) {
+                Ok "其中 $($factory.Count) 个是小米原厂入口 —— 按策略【保留不删】，"
+                Ok '「显示更多选项」里的「使用小米互传发送」不受影响。'
+            }
+
+            if ($others.Count -eq 0) {
+                Ok '没有非原厂来源的残留键，无需清理；原厂入口保持原样。'
+            }
+            else {
+                Write-Host "    另有 $($others.Count) 个【非原厂】来源的键：" -ForegroundColor Yellow
+                foreach ($v in $others) { Write-Host "      - $($v.Path)" -ForegroundColor Yellow }
+                $doPurge = $false
+                if ($PurgeRegistryVerbs) { $doPurge = $true }
+                else {
+                    $ans = (Read-Host '    要清理这些非原厂残留键吗？(y/n，默认 n)').Trim().ToLower()
+                    $doPurge = ($ans -eq 'y')
+                }
+                if ($doPurge) {
+                    # 只传非原厂键，且不带 -IncludeFactory → 双保险，原厂键绝不会被删
+                    $r = Remove-MiDropRegVerbs -Verbs $others -BackupFirst
+                    if ($r.Removed -gt 0) {
+                        Ok "已清理 $($r.Removed) 个非原厂残留键（原厂入口 $($factory.Count) 个已保留）。"
+                        # 删过注册表后，.reg 是唯一回滚手段 → 强制保留 backup 目录
+                        $purgeKeptBackup = $true
+                        if ($r.BackupFiles.Count -gt 0) {
+                            Write-Host '    回滚备份（务必保留）：' -ForegroundColor Yellow
+                            foreach ($f in $r.BackupFiles) { Write-Host "      $f" -ForegroundColor Yellow }
+                            Warn '如需恢复：用 64 位 regedit（%WINDIR%\regedit.exe）导入上述 .reg。'
+                        }
+                    }
+                    else { Warn '没有删除任何注册表键（多半是无权限）。请以管理员身份重跑。' }
+                }
+                else { Info '已保留，未做删除。' }
+            }
+        }
+    }
+
+    Info '6/6 清理生成文件 ...'
+    # 先显式处理注册表备份目录：默认删除；加 -KeepBackup、或本轮刚删过注册表键则保留。
     $backupDir = $script:BackupRoot
-    if ($KeepBackup) {
-        if (Test-Path -LiteralPath $backupDir) { Info '已指定 -KeepBackup，注册表备份目录将保留。' }
+    if ($KeepBackup -or $purgeKeptBackup) {
+        if ($purgeKeptBackup -and -not $KeepBackup) {
+            Warn '本轮删除过注册表键，已强制保留备份目录（内含回滚用的 .reg）。'
+        }
+        elseif (Test-Path -LiteralPath $backupDir) { Info '已指定 -KeepBackup，注册表备份目录将保留。' }
         else { Info '已指定 -KeepBackup，但注册表备份目录不存在。' }
     }
     else {
@@ -1020,7 +1238,8 @@ function Show-Menu {
     Write-Host '                   想先看看效果选这个。'
     Write-Host ''
     Write-Host '   [4] 彻底删除      ' -NoNewline -ForegroundColor Yellow
-    Write-Host '注销包 + 还原开关 + 卸载自动装的 SDK + 删掉生成的文件。' -ForegroundColor Gray
+    Write-Host '注销包 + 还原开关 + 卸载 SDK + 清理注册表残留 + 删生成文件。' -ForegroundColor Gray
+    Write-Host '                   只清非原厂残留键，小米原厂入口保留不动（删前自动 .reg 备份）。'
     Write-Host ''
     Write-Host '   [5] 查看当前状态' -ForegroundColor Gray
     Write-Host '   [0] 退出' -ForegroundColor Gray
