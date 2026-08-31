@@ -24,6 +24,7 @@
      powershell -ExecutionPolicy Bypass -File .\Install-RouteB-SignedMsix.ps1
 ================================================================================
 #>
+#Requires -Version 5.1
 [CmdletBinding()]
 param(
     [switch]$NoRestartExplorer,
@@ -34,7 +35,9 @@ param(
 $ErrorActionPreference = 'Stop'
 $PackageName  = 'MiDropWin11MenuShim'
 $CertSubject  = 'CN=MiDropWin11MenuShim'   # 必须与 AppxManifest.xml 的 Publisher 完全一致
-$StageRoot    = 'C:\ProgramData\MiDropWin11Menu'
+# 用 ProgramFiles / ProgramData 环境变量，避免系统盘不是 C: 时找不到
+$MiRoot       = Join-Path ${env:ProgramFiles} 'MI\HyperConnect'
+$StageRoot    = Join-Path ${env:ProgramData} 'MiDropWin11Menu'
 $StageSparse  = Join-Path $StageRoot 'sparse'
 $BackupDir    = Join-Path $StageRoot 'backup'
 $OutMsix      = Join-Path $StageRoot 'MiDropWin11MenuShim.msix'
@@ -60,8 +63,17 @@ function Find-SdkTool([string]$name) {
         $p = Join-Path $SdkBin $name
         if (Test-Path -LiteralPath $p) { return $p }
     }
-    foreach ($root in @('C:\Program Files (x86)\Windows Kits\10\bin', 'C:\Program Files\Windows Kits\10\bin')) {
-        if (-not (Test-Path $root)) { continue }
+    # 优先用 SDK 自己导出的环境变量（最准确，也免去全盘扫描）
+    if ($env:WindowsSdkVerBinPath) {
+        $p = Join-Path $env:WindowsSdkVerBinPath $name
+        if (Test-Path -LiteralPath $p) { return $p }
+    }
+    $binRoots = @()
+    if ($env:WindowsSdkBinPath) { $binRoots += $env:WindowsSdkBinPath }
+    $binRoots += @("${env:ProgramFiles(x86)}\Windows Kits\10\bin", "${env:ProgramFiles}\Windows Kits\10\bin")
+
+    foreach ($root in $binRoots) {
+        if (-not $root -or -not (Test-Path -LiteralPath $root)) { continue }
         # 按真实版本号降序（目录名字符串排序会把 10.0.9900 错排到 10.0.26100 前面）
         $dirs = Get-ChildItem $root -Directory -ErrorAction SilentlyContinue | ForEach-Object {
             $v = $null
@@ -88,7 +100,7 @@ Ok "MakeAppx: $makeappx"
 Ok "SignTool: $signtool"
 
 # ------------------------------------------------- 1. 定位小米互联服务安装目录
-$candidates = Get-ChildItem 'C:\Program Files\MI\HyperConnect' -Directory -ErrorAction SilentlyContinue |
+$candidates = @(Get-ChildItem -LiteralPath $MiRoot -Directory -ErrorAction SilentlyContinue |
     ForEach-Object {
         $dll = Join-Path $_.FullName 'resources\native-interconnect\win32\MiDropShellExt.dll'
         if (Test-Path -LiteralPath $dll) {
@@ -96,8 +108,8 @@ $candidates = Get-ChildItem 'C:\Program Files\MI\HyperConnect' -Directory -Error
             try { $ver = [version]$_.Name } catch { }
             [pscustomobject]@{ Version = $ver; Win32 = Split-Path $dll -Parent; Dll = $dll }
         }
-    } | Sort-Object Version -Descending
-if (-not $candidates) { Die '未找到 MiDropShellExt.dll。' }
+    } | Sort-Object Version -Descending)
+if ($candidates.Count -eq 0) { Die '未找到 MiDropShellExt.dll。' }
 $mi = $candidates[0]
 Ok "外部位置（-ExternalLocation）：$($mi.Win32)"
 
@@ -227,8 +239,14 @@ Ok '签名完成。'
 Remove-Item -LiteralPath $pfxPath -Force -ErrorAction SilentlyContinue   # 私钥文件用完即删
 
 # --------------------------------------------------------------- 6. 安装包
-$existing = Get-AppxPackage -Name $PackageName -ErrorAction SilentlyContinue
-if ($existing) { Info "移除旧注册 $($existing.PackageFullName)"; Remove-AppxPackage -Package $existing.PackageFullName }
+$existing = @(Get-AppxPackage -Name $PackageName -ErrorAction SilentlyContinue)
+foreach ($e in $existing) {
+    Info "移除旧注册 $($e.PackageFullName)"
+    Remove-AppxPackage -Package $e.PackageFullName -ErrorAction SilentlyContinue
+}
+# 若包被注册到「所有用户」，补一次 -AllUsers 移除
+$left = @(Get-AppxPackage -Name $PackageName -ErrorAction SilentlyContinue)
+foreach ($e in $left) { Remove-AppxPackage -Package $e.PackageFullName -AllUsers -ErrorAction SilentlyContinue }
 
 Info '安装稀疏包（-ExternalLocation 指向小米原装目录）…'
 try {
