@@ -6,7 +6,8 @@
 > - ✅ 把右键项从「显示更多选项」里提升到 Win11 原生新菜单第一层；
 > - ❌ **不**整体回退为 Windows 10 旧版菜单（不动 `{86ca1aa0-...}` 全局开关）；
 > - ❌ **不**改变系统全局行为；
-> - ❌ **不**修改小米互联服务的任何原厂注册表键值（只读）。
+> - ❌ **不**修改小米互联服务的任何原厂注册表键值（只读）。卸载时的注册表清理
+>   **只针对非原厂来源**的 `MiDropExtMenu` 键，**原厂入口一律保留不删** —— 详见下文。
 >
 > 安装过程中会**临时关闭 Windows 安全中心实时防护**以便顺利完成注册/签名/证书导入，
 > 安装结束（成功或失败都会）**自动精确恢复**，详见下文「安装时临时关闭安全中心」。
@@ -120,6 +121,8 @@ powershell -ExecutionPolicy Bypass -File .\Uninstall.ps1    # 完整回滚
 - `-KeepDeveloperMode`：不动「开发人员模式」开关。
 - `-KeepSdk`：保留 Windows SDK。
 - `-NoRestartExplorer`：不重启 explorer.exe。
+- `-PurgeRegistryVerbs`：确认清理**非原厂**残留键（不再询问；**原厂入口仍保留不删**）。
+- `-KeepRegistryVerbs`：跳过注册表搜索与清理（既不搜索也不删除）。
 
 若 Windows SDK 10.0.26100 由脚本自动安装过，卸载时会一并移除；无法确认来源时会询问。SDK 移除顺序：先 `winget uninstall`，失败则按 ARP 里的 ProductCode 走 `msiexec /x /qn`。
 
@@ -154,6 +157,58 @@ powershell -ExecutionPolicy Bypass -File .\Uninstall.ps1    # 完整回滚
 - 默认情况下，`Uninstall.ps1` 会**显式删除** `C:\ProgramData\MiDropWin11Menu\backup\` 下的注册表备份，随后清理整个暂存目录。
 - 若你希望保留备份用于人工比对或后续手动回滚，请运行 `powershell -ExecutionPolicy Bypass -File .\Uninstall.ps1 -KeepBackup`。
 
+### 清理注册表里的 MiDropExtMenu 残留
+
+卸载流程的**步骤 5/6** 会全量搜索注册表里的 `MiDropExtMenu` 键，但**只清理非原厂来源的键，
+小米原厂入口一律保留不删**。
+
+判定规则：键的 `ExplorerCommandHandler` **严格等于**小米 CLSID `{504d69c0-cb52-48df-b5b5-7161829fabc8}`
+即认定为原厂入口 → 保留；否则视为非原厂残留 → 可清理。
+
+**先厘清一个常见误解**：`HKEY_CLASSES_ROOT`（HKCR）**不是独立的物理键**，它只是
+`HKLM\SOFTWARE\Classes` 与 `HKCU\Software\Classes` 的**合并视图**。所以在 regedit 里
+看到下面 4 条路径，实际通常只有 **2 个物理键**：
+
+| regedit 里看到的路径 | 性质 |
+|---|---|
+| `HKEY_CLASSES_ROOT\*\shell\MiDropExtMenu` | 视图，与下面第 3 条是**同一个键** |
+| `HKEY_CLASSES_ROOT\Directory\shell\MiDropExtMenu` | 视图，与下面第 4 条是**同一个键** |
+| `HKLM\SOFTWARE\Classes\*\shell\MiDropExtMenu` | 物理键（原厂通常注册在这里） |
+| `HKLM\SOFTWARE\Classes\Directory\shell\MiDropExtMenu` | 物理键 |
+
+因此脚本**只搜索真实物理位置**，不会把同一份数据重复计数、重复删除：
+
+- `HKLM\SOFTWARE\Classes`（64 位机器级）
+- `HKCU\Software\Classes`（用户级）
+- `HKLM\SOFTWARE\WOW6432Node\Classes`（32 位视图）
+
+**默认行为**：搜索 → 分类列出（标注原厂 / 非原厂）→ 原厂键直接跳过，非原厂键询问后才清理。
+
+```powershell
+# 搜索并询问（默认，推荐）
+powershell -ExecutionPolicy Bypass -File .\Uninstall.ps1
+
+# 确认清理非原厂残留，不再询问（原厂入口仍保留）
+powershell -ExecutionPolicy Bypass -File .\Uninstall.ps1 -PurgeRegistryVerbs
+
+# 完全跳过注册表搜索与清理
+powershell -ExecutionPolicy Bypass -File .\Uninstall.ps1 -KeepRegistryVerbs
+```
+
+清理时的保护：
+
+- **原厂入口绝不删除**（函数级双保险：只传非原厂键 + 默认不带 `-IncludeFactory`）；
+- 清理前**先用 `Export-RegKeyPS` 把每个键导出成 `.reg`** 存到备份目录；
+- 清理后**强制保留备份目录**（即使没加 `-KeepBackup`），因为此时 `.reg` 是唯一回滚手段；
+- 用 .NET 的 `DeleteSubKeyTree` 删除，避开 `Remove-Item` 遇到路径里 `*` 时的通配符/视图问题。
+
+> **正常安装后再卸载，通常什么都不用清**：本方案的稀疏包只含 `AppxManifest.xml`，
+> 从不往注册表写 `MiDropExtMenu`。你机器上那 2 个键是小米原厂的旧菜单入口，
+> 脚本会识别出来并**保留**，你会看到「没有非原厂来源的残留键，无需清理；原厂入口保持原样」。
+
+**恢复方法**：若确有非原厂键被清理，用 **64 位** regedit（`%WINDIR%\regedit.exe`）
+导入备份目录里的 `PurgeVerbs-*.reg`，然后重启 explorer。
+
 回滚顺序：
 
 1. 运行 `Uninstall.ps1`（默认会删除注册表备份；加 `-KeepBackup` 可保留）
@@ -187,6 +242,9 @@ powershell -ExecutionPolicy Bypass -File .\Uninstall.ps1    # 完整回滚
 5. **开发人员模式**（路线 A）—— 全局开关，会允许安装任意未签名松散文件包；卸载脚本自动还原。
 6. **安装时会临时关闭安全中心实时防护** —— 如上节所述，仅安装期间、自动恢复，且受防篡改保护限制时会优雅跳过。
 7. **仅供本机使用** —— 自签名包只在导入同一张证书的机器上可装，无法分发给他人。
+8. **注册表清理只针对非原厂键，原厂入口不受影响** —— 判定依据是 `ExplorerCommandHandler`
+   是否严格等于小米 CLSID `{504d69c0-...}`：等于即视为原厂入口并**保留**，不等才当作残留清理。
+   清理前会自动导出 `.reg`，可用 **64 位** regedit 导入恢复。
 
 ## 参考
 
