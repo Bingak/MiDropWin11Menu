@@ -8,9 +8,12 @@
    powershell -ExecutionPolicy Bypass -File .\Diagnose.ps1
 ================================================================================
 #>
+#Requires -Version 5.1
 $ErrorActionPreference = 'Continue'
 $TargetClsid = '{504d69c0-cb52-48df-b5b5-7161829fabc8}'
 $PackageName = 'MiDropWin11MenuShim'
+# 用 ProgramFiles 环境变量，避免系统盘不是 C: 时找不到组件
+$MiRoot = Join-Path ${env:ProgramFiles} 'MI\HyperConnect'
 
 function H($t) { Write-Host ''; Write-Host "── $t " -ForegroundColor Cyan -NoNewline; Write-Host ('─' * [Math]::Max(0, 60 - $t.Length)) -ForegroundColor DarkCyan }
 function KV($k, $v) { Write-Host ("  {0,-34}" -f $k) -NoNewline -ForegroundColor Gray; Write-Host $v }
@@ -93,6 +96,22 @@ else {
     Write-Host '  → 无包标识，条目只会出现在「显示更多选项」旧菜单里。' -ForegroundColor Yellow
 }
 
+H '安装状态文件'
+$stateFile = Join-Path ${env:ProgramData} 'MiDropWin11Menu\install-state.json'
+if (Test-Path -LiteralPath $stateFile) {
+    try {
+        $st = Get-Content -LiteralPath $stateFile -Raw -ErrorAction Stop | ConvertFrom-Json
+        KV 'Route' $st.Route
+        KV 'ExternalLocation' $st.ExternalLocation
+        KV '  有效性' $(if ($st.ExternalLocation -and (Test-Path -LiteralPath $st.ExternalLocation)) { '有效' } else { '已失效（组件可能已升级，需重装）' })
+        KV 'DevModeChangedByUs' $st.DevModeChangedByUs
+        KV 'SdkInstalledByUs' $st.SdkInstalledByUs
+        KV 'InstalledAt' $st.InstalledAt
+    }
+    catch { KV $stateFile '解析失败（文件已损坏）' }
+}
+else { KV $stateFile '不存在（尚未安装或已清理）' }
+
 H '环境开关与工具'
 $unlock = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock'
 $dev = if (Test-Path $unlock) { (Get-ItemProperty $unlock).AllowDevelopmentWithoutDevLicense } else { $null }
@@ -100,8 +119,18 @@ KV '开发人员模式' $(if ($dev -eq 1) { '开启（路线 A 可用）' } else
 $classic = 'HKCU:\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}'
 KV '全局回退旧菜单开关' $(if (Test-Path -LiteralPath $classic) { '存在 —— 整个右键菜单已回退为 Win10 旧版' } else { '不存在（新菜单正常，符合预期）' })
 $mk = $null
-foreach ($root in @('C:\Program Files (x86)\Windows Kits\10\bin', 'C:\Program Files\Windows Kits\10\bin')) {
-    if (-not (Test-Path $root)) { continue }
+# 优先用 SDK 自己导出的环境变量，其次扫描安装目录（逻辑与安装脚本保持一致）
+$binRoots = @()
+if ($env:WindowsSdkVerBinPath) {
+    $p = Join-Path $env:WindowsSdkVerBinPath 'makeappx.exe'
+    if (Test-Path -LiteralPath $p) { $mk = $p }
+}
+if (-not $mk) {
+    if ($env:WindowsSdkBinPath) { $binRoots += $env:WindowsSdkBinPath }
+    $binRoots += @("${env:ProgramFiles(x86)}\Windows Kits\10\bin", "${env:ProgramFiles}\Windows Kits\10\bin")
+}
+foreach ($root in $binRoots) {
+    if (-not $root -or -not (Test-Path -LiteralPath $root)) { continue }
     # 只认 x64 子目录且按真实版本号降序：
     # 字符串排序会把 10.0.9900 错排到 10.0.26100 之前；不滤 x64 会命中 arm64 工具
     $dirs = Get-ChildItem $root -Directory -ErrorAction SilentlyContinue | ForEach-Object {
