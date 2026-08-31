@@ -55,7 +55,7 @@ MiDropShellExt.dll  ──有 IExplorerCommand、无包标识──▶ 旧菜单
 
 签名 `.msix` 走 Windows 默认已启用的旁加载，**不需要开启开发人员模式**，唯一改动是导入一张自签名证书公钥（卸载时会移除）。
 
-先安装 Windows SDK 的签名工具（体积很小，向导里只勾选 **Signing Tools for Desktop Apps**）：
+先安装 Windows SDK 的签名工具：
 
 ```powershell
 winget install --id Microsoft.WindowsSDK.10.0.26100 --accept-package-agreements
