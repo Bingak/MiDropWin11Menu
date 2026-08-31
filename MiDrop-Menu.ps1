@@ -8,8 +8,9 @@
  功能
    1) 路线 B 安装  —— 签名 .msix，不改任何系统全局开关      [推荐]
    2) 路线 A 安装  —— 免 SDK 免证书，但会开启「开发人员模式」
-   3) 体验一下      —— 临时启用，重启电脑后自动失效，不留痕迹
-   4) 彻底删除      —— 注销包 + 还原开关 + 移除证书 + 删除全部生成文件
+   3) 体验一下      —— 注册后立即测试，回车确认后自动注销还原
+   4) 彻底删除      —— 注销包 + 还原开关 + 移除证书 + 卸载本脚本
+                      自动装的 Windows SDK + 删除全部生成文件
    5) 查看当前状态
    0) 退出
 ================================================================================
@@ -39,6 +40,9 @@ $UnlockKey   = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock'
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 if ($PSCommandPath) { $ScriptDir = Split-Path -Parent $PSCommandPath }
+
+# 本会话内是否由脚本自动安装过 Windows SDK（写入状态文件，卸载时据此决定是否移除）
+$script:SdkInstalledByUs = $false
 
 # ------------------------------------------------------------------ 工具函数
 function Write-Line { Write-Host ('=' * 62) -ForegroundColor DarkGray }
@@ -88,6 +92,51 @@ function Get-MiDropDir {
     return $hit[0]
 }
 
+# 纯 .NET 的 .reg 导出（回退用）：
+# 某些安全策略会禁用 reg.exe，导致原备份逻辑静默失败。
+# 用 Registry API 手工生成 regedit 可导入的 "Version 5.00" 格式（UTF-16LE + CRLF）。
+# 注意：OpenSubKey 把键名当字面量处理，路径里的 * 不会被当通配符，正好符合需要。
+function Export-RegKeyPS {
+    param([string]$RootKey, [string]$DestFile)
+    $hiveMap    = @{ 'HKLM' = [Microsoft.Win32.Registry]::LocalMachine; 'HKCU' = [Microsoft.Win32.Registry]::CurrentUser }
+    $hiveNameMap = @{ 'HKLM' = 'HKEY_LOCAL_MACHINE'; 'HKCU' = 'HKEY_CURRENT_USER' }
+    $parts = $RootKey -split '\\', 2
+    if ($parts.Count -lt 2 -or -not $hiveMap.ContainsKey($parts[0])) { return $false }
+    $root = $hiveMap[$parts[0]].OpenSubKey($parts[1])
+    if (-not $root) { return $false }
+    $lines = New-Object System.Collections.Generic.List[string]
+    $lines.Add('Windows Registry Editor Version 5.00')
+    function Escape-RegText([string]$s) { (($s -replace '\\', '\\') -replace '"', '\"') }
+    function Walk($key, [string]$pathText) {
+        $lines.Add('')
+        $lines.Add("[$pathText]")
+        foreach ($vn in $key.GetValueNames()) {
+            $kind = $key.GetValueKind($vn)
+            $val  = $key.GetValue($vn, '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+            $name = if ($vn -eq '') { '@' } else { '"' + (Escape-RegText $vn) + '"' }
+            switch ("$kind") {
+                'String'       { $lines.Add($name + '="' + (Escape-RegText ([string]$val)) + '"') }
+                'ExpandString' { $lines.Add($name + '=hex(2):' + (([Text.Encoding]::Unicode.GetBytes("$val" + [char]0) | ForEach-Object { $_.ToString('x2') }) -join ',')) }
+                'DWord'        { $lines.Add($name + ('=dword:{0:x8}' -f [uint32]$val)) }
+                'QWord'        { $lines.Add($name + '=hex(b):' + (([BitConverter]::GetBytes([uint64]$val) | ForEach-Object { $_.ToString('x2') }) -join ',')) }
+                'Binary'       { $lines.Add($name + '=hex:' + ((@($val) | ForEach-Object { $_.ToString('x2') }) -join ',')) }
+                default        { $lines.Add($name + '="' + (Escape-RegText ([string]$val)) + '"') }
+            }
+        }
+        foreach ($sk in $key.GetSubKeyNames()) {
+            $sub = $null
+            try { $sub = $key.OpenSubKey($sk) } catch { }
+            if ($sub) { Walk $sub "$pathText\$sk" }
+        }
+    }
+    Walk $root ("{0}\{1}" -f $hiveNameMap[$parts[0]], $parts[1])
+    try {
+        [IO.File]::WriteAllLines($DestFile, $lines, [Text.Encoding]::Unicode)
+        return $true
+    }
+    catch { return $false }
+}
+
 function Backup-Registry {
     if (-not (Test-Path -LiteralPath $BackupRoot)) {
         New-Item -ItemType Directory -Path $BackupRoot -Force | Out-Null
@@ -102,6 +151,10 @@ function Backup-Registry {
     foreach ($k in $targets.Keys) {
         $dest = Join-Path $BackupRoot $k
         & "$env:WINDIR\System32\reg.exe" export $targets[$k] $dest /y 2>&1 | Out-Null
+        if (-not (Test-Path -LiteralPath $dest)) {
+            # reg.exe 被安全策略禁用 / 导出失败 → 纯 .NET 回退
+            $null = Export-RegKeyPS -RootKey $targets[$k] -DestFile $dest
+        }
         if (-not (Test-Path -LiteralPath $dest)) { $ok = $false }
     }
     return $ok
@@ -147,12 +200,62 @@ function Remove-Package {
 function Find-SdkTool([string]$name) {
     foreach ($root in @("${env:ProgramFiles(x86)}\Windows Kits\10\bin", "$env:ProgramFiles\Windows Kits\10\bin")) {
         if (-not (Test-Path $root)) { continue }
-        $hit = Get-ChildItem -LiteralPath $root -Recurse -Filter $name -ErrorAction SilentlyContinue |
-               Where-Object { (Split-Path $_.DirectoryName -Leaf) -ieq 'x64' } |
-               Sort-Object FullName -Descending | Select-Object -First 1
-        if ($hit) { return $hit.FullName }
+        # 按真实版本号降序（目录名字符串排序会把 10.0.9900 错排到 10.0.26100 前面）
+        $dirs = Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+            $v = $null
+            try { $v = [version]$_.Name } catch { }
+            if ($v) { [pscustomobject]@{ Ver = $v; Dir = $_.FullName } }
+        } | Sort-Object Ver -Descending
+        foreach ($d in $dirs) {
+            $p = Join-Path $d.Dir "x64\$name"
+            if (Test-Path -LiteralPath $p) { return $p }
+        }
     }
     return $null
+}
+
+# 是否装了 Windows SDK 10.0.26100（以 ARP 卸载项为准，与补丁版本号 .7705 等无关）
+# 注意：SDK 主包是 32 位 MSI，ARP 条目注册在 WOW6432Node 视图，必须两个都查
+function Test-Sdk26100Installed {
+    $e = @(Get-ItemProperty @(
+                'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+                'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+            ) -ErrorAction SilentlyContinue |
+          Where-Object { $_.DisplayName -like 'Windows Software Development Kit - Windows 10.0.26100*' })
+    return (@($e).Count -gt 0)
+}
+
+# 卸载 Windows SDK 10.0.26100：优先 winget，失败则查 ARP ProductCode 走 msiexec
+function Remove-Sdk26100 {
+    if (-not (Test-Sdk26100Installed)) { Ok '未检测到 Windows SDK 10.0.26100，无需移除。'; return }
+
+    $wg = Get-Command winget.exe -ErrorAction SilentlyContinue
+    if ($wg) {
+        Info '正在通过 winget 卸载 Windows SDK 10.0.26100（可能需要几分钟）...'
+        & winget uninstall --id Microsoft.WindowsSDK.10.0.26100 --silent --disable-interactivity 2>&1 | Out-Null
+    }
+    if (Test-Sdk26100Installed) {
+        # winget 没找到该条目（常见于 SDK 由 MSI 向导手动安装）→ 用 ProductCode 兜底
+        $entries = @(Get-ItemProperty @(
+                'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+                'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+            ) -ErrorAction SilentlyContinue |
+            Where-Object { $_.DisplayName -like 'Windows Software Development Kit - Windows 10.0.26100*' })
+        foreach ($e in @($entries)) {
+            Info "通过 msiexec 卸载 $($e.DisplayName) ..."
+            $p = Start-Process -FilePath "$env:WINDIR\System32\msiexec.exe" `
+                 -ArgumentList "/x $($e.PSChildName) /qn /norestart" -Wait -PassThru
+            # 0 = 成功；3010 = 成功但需重启；1605 = 本就不存在
+            if ($p.ExitCode -notin @(0, 3010, 1605)) {
+                Warn "msiexec 退出码 $($p.ExitCode)（非 0/3010/1605）"
+            }
+        }
+    }
+    if (Test-Sdk26100Installed) {
+        Warn 'SDK 未完全移除。可稍后在「设置 → 应用」中手动卸载，或运行：'
+        Warn '  winget uninstall --id Microsoft.WindowsSDK.10.0.26100'
+    }
+    else { Ok 'Windows SDK 10.0.26100 已移除。' }
 }
 
 function Restart-ExplorerNow {
@@ -171,7 +274,7 @@ function Save-State([hashtable]$data) {
 }
 
 # ------------------------------------------------------------------ 安装动作
-function Invoke-RegisterPackage([string]$Win32Dir, [string]$Route, [bool]$DevModeChanged, [string]$Thumb) {
+function Invoke-RegisterPackage([string]$Win32Dir, [string]$Route, [bool]$DevModeChanged, [string]$Thumb, [bool]$SdkInstalled) {
     Info '正在注册稀疏包 ...'
     try {
         if ($Route -eq 'A') {
@@ -198,6 +301,7 @@ function Invoke-RegisterPackage([string]$Win32Dir, [string]$Route, [bool]$DevMod
         ExternalLocation   = $Win32Dir
         DevModeChangedByUs = $DevModeChanged
         CertThumbprint     = $Thumb
+        SdkInstalledByUs   = $SdkInstalled
         BackupDir          = $BackupRoot
     }
     return $true
@@ -244,13 +348,27 @@ function Install-RouteA([bool]$Trial) {
 
     Remove-Package | Out-Null
 
-    if (-not (Invoke-RegisterPackage $mi.Win32 'A' $changed '')) { return }
+    if (-not (Invoke-RegisterPackage $mi.Win32 'A' $changed '' $false)) { return }
 
     if ($Trial) {
+        Restart-ExplorerNow
         Write-Host ''
-        Ok '已临时启用！右键文件即可看到效果。'
-        Warn '这是体验模式：重启电脑后自动失效，不留任何痕迹。'
-        Warn '注意：此时「开发人员模式」仍处于开启状态，按 [4] 彻底删除可还原。'
+        Ok '体验模式已启用！现在右键任意文件，看看新版菜单第一层是否出现。'
+        Warn '体验注册同样是持久的，不会因重启电脑自动消失；'
+        Warn '请在测试完毕后回到本窗口按回车，脚本会自动注销并还原。'
+        $null = Read-Host '  测试完毕后按回车，自动注销并还原'
+        Info '正在注销体验注册 ...'
+        Remove-Package | Out-Null
+        if ($changed) {
+            Set-ItemProperty -Path $UnlockKey -Name 'AllowDevelopmentWithoutDevLicense' -Value 0 -Type DWord -Force
+            Info '「开发人员模式」已还原为关闭。'
+        }
+        if (Test-Path -LiteralPath $StageRoot) {
+            Remove-Item -LiteralPath $StageRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        Restart-ExplorerNow
+        Ok '体验结束，已恢复原状，未留任何痕迹。'
+        Warn '若本窗口意外关闭导致未还原，重新运行脚本选 [4] 彻底删除即可。'
     }
     else {
         Restart-ExplorerNow
@@ -282,15 +400,24 @@ function Install-RouteB {
         Write-Host '   c) 返回主菜单'
         $c = (Read-Host '   请选择 a/b/c').Trim().ToLower()
         if ($c -eq 'a') {
+            if (-not (Get-Command winget.exe -ErrorAction SilentlyContinue)) {
+                Err '未检测到 winget，无法自动安装。请手动安装 Windows SDK 或改用路线 A。'
+                return
+            }
             Info '正在通过 winget 安装 Windows SDK，请稍候 ...'
             winget install --id Microsoft.WindowsSDK.10.0.26100 --accept-package-agreements --accept-source-agreements
+            if ($LASTEXITCODE -ne 0) {
+                Err "winget 安装失败，退出码 $LASTEXITCODE。可稍后重试或改用路线 A。"
+                return
+            }
+            $script:SdkInstalledByUs = $true
             $makeappx = Find-SdkTool 'makeappx.exe'
             $signtool = Find-SdkTool 'signtool.exe'
             if (-not $makeappx -or -not $signtool) {
                 Err '安装后仍未找到工具。请重新打开本窗口再试，或改用路线 A。'
                 return
             }
-            Ok 'SDK 已就绪。'
+            Ok 'SDK 已就绪（卸载本工具时会提示是否一并移除它）。'
         }
         elseif ($c -eq 'b') { Install-RouteA $false; return }
         else { return }
@@ -341,7 +468,7 @@ function Install-RouteB {
     Ok '签名完成，私钥文件已销毁。'
 
     Remove-Package | Out-Null
-    if (-not (Invoke-RegisterPackage $mi.Win32 'B' $false $cert.Thumbprint)) { return }
+    if (-not (Invoke-RegisterPackage $mi.Win32 'B' $false $cert.Thumbprint $script:SdkInstalledByUs)) { return }
 
     Restart-ExplorerNow
     Write-Host ''
@@ -367,17 +494,18 @@ function Invoke-FullRemoval {
     Write-Host '    1. 注销右键菜单包（新菜单里的条目消失）'
     Write-Host '    2. 还原「开发人员模式」开关（若当初由本脚本开启）'
     Write-Host '    3. 移除自签名证书'
-    Write-Host '    4. 删除 C:\ProgramData\MiDropWin11Menu（含注册表备份）'
+    Write-Host '    4. 卸载本脚本自动安装的 Windows SDK 10.0.26100（若有）'
+    Write-Host '    5. 删除 C:\ProgramData\MiDropWin11Menu（含注册表备份）'
     Write-Host '  不会动小米互联服务本身及其原厂右键注册。'
     Write-Host ''
     $c = (Read-Host '  确认删除？输入 y 继续，其它取消').Trim().ToLower()
     if ($c -ne 'y') { Info '已取消。'; return }
 
     Write-Host ''
-    Info '1/4 注销包 ...'
+    Info '1/5 注销包 ...'
     if (Remove-Package) { Ok '已注销（或本就未安装）。' } else { Warn '包可能仍被占用，请注销重登后重试一次。' }
 
-    Info '2/4 还原「开发人员模式」...'
+    Info '2/5 还原「开发人员模式」...'
     if ($state -and $state.DevModeChangedByUs -eq $true) {
         if (Test-Path $UnlockKey) {
             Set-ItemProperty -Path $UnlockKey -Name 'AllowDevelopmentWithoutDevLicense' -Value 0 -Type DWord -Force
@@ -393,7 +521,7 @@ function Invoke-FullRemoval {
         else { Info '保持原状。' }
     }
 
-    Info '3/4 移除证书 ...'
+    Info '3/5 移除证书 ...'
     $n = 0
     foreach ($c2 in @(Get-ChildItem Cert:\LocalMachine\TrustedPeople -ErrorAction SilentlyContinue | Where-Object { $_.Subject -eq $CertSubject })) {
         Remove-Item -LiteralPath $c2.PSPath -Force -ErrorAction SilentlyContinue; $n++
@@ -403,15 +531,31 @@ function Invoke-FullRemoval {
     }
     Ok "已移除 $n 张证书。"
 
-    Info '4/4 删除生成文件 ...'
+    Info '4/5 移除 Windows SDK（若由本脚本自动安装）...'
+    if ($state -and $state.SdkInstalledByUs -eq $true) {
+        Remove-Sdk26100
+    }
+    elseif (Test-Sdk26100Installed) {
+        Warn '检测到已安装 Windows SDK 10.0.26100，但状态文件未记录它由本脚本安装'
+        Warn '（可能是你之前用其它方式装的）。'
+        $c3 = (Read-Host '    要一并卸载它吗？(y/n)').Trim().ToLower()
+        if ($c3 -eq 'y') { Remove-Sdk26100 } else { Info '保留 Windows SDK。' }
+    }
+    else { Info '未检测到 Windows SDK 10.0.26100，跳过。' }
+
+    Info '5/5 删除生成文件 ...'
     Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
     Start-Sleep -Seconds 1
-    # 等 dllhost 释放句柄，最多 15 秒
+    # 结束仍加载扩展 DLL 的 dllhost 代理进程（访问 Modules 可能因权限抛异常，逐个容错）
     $deadline = (Get-Date).AddSeconds(15)
     while ((Get-Date) -lt $deadline) {
-        Get-Process dllhost -ErrorAction SilentlyContinue | Where-Object {
-            $_.Modules -match 'MiDropShellExt'
-        } | Stop-Process -Force -ErrorAction SilentlyContinue
+        Get-Process dllhost -ErrorAction SilentlyContinue | ForEach-Object {
+            try {
+                $mods = $_.Modules | Where-Object { $_.ModuleName -match 'MiDropShellExt' }
+                if ($mods) { Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue }
+            }
+            catch { }
+        }
         if (Test-Path -LiteralPath $StageRoot) {
             Remove-Item -LiteralPath $StageRoot -Recurse -Force -ErrorAction SilentlyContinue
         }
@@ -525,7 +669,7 @@ function Show-Menu {
     Write-Host '免 SDK 免证书，但会开启系统「开发人员模式」。' -ForegroundColor Gray
     Write-Host ''
     Write-Host '   [3] 体验一下      ' -NoNewline -ForegroundColor Cyan
-    Write-Host '临时启用，重启电脑后自动失效，不留痕迹。' -ForegroundColor Gray
+    Write-Host '注册后立即测试，回车确认后自动注销还原。' -ForegroundColor Gray
     Write-Host '                   想先看看效果选这个。'
     Write-Host ''
     Write-Host '   [4] 彻底删除      ' -NoNewline -ForegroundColor Yellow

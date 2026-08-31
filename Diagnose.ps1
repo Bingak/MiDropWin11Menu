@@ -101,9 +101,25 @@ $classic = 'HKCU:\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}'
 KV '全局回退旧菜单开关' $(if (Test-Path -LiteralPath $classic) { '存在 —— 整个右键菜单已回退为 Win10 旧版' } else { '不存在（新菜单正常，符合预期）' })
 $mk = $null
 foreach ($root in @('C:\Program Files (x86)\Windows Kits\10\bin', 'C:\Program Files\Windows Kits\10\bin')) {
-    if (Test-Path $root) { $mk = Get-ChildItem $root -Recurse -Filter 'makeappx.exe' -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName }
+    if (-not (Test-Path $root)) { continue }
+    # 只认 x64 子目录且按真实版本号降序：
+    # 字符串排序会把 10.0.9900 错排到 10.0.26100 之前；不滤 x64 会命中 arm64 工具
+    $dirs = Get-ChildItem $root -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+        $v = $null; try { $v = [version]$_.Name } catch { }
+        if ($v) { [pscustomobject]@{ Ver = $v; Dir = $_.FullName } }
+    } | Sort-Object Ver -Descending
+    foreach ($d in $dirs) {
+        $p = Join-Path $d.Dir 'x64\makeappx.exe'
+        if (Test-Path -LiteralPath $p) { $mk = $p; break }
+    }
     if ($mk) { break }
 }
-KV 'MakeAppx.exe' $(if ($mk) { $mk } else { '未安装（路线 B 需要 Windows SDK）' })
+KV 'MakeAppx.exe (x64)' $(if ($mk) { $mk } else { '未安装（路线 B 需要 Windows SDK）' })
+$sdk26100 = @(Get-ItemProperty @(
+    'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+    'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+) -ErrorAction SilentlyContinue |
+    Where-Object { $_.DisplayName -like 'Windows Software Development Kit - Windows 10.0.26100*' })
+KV 'Windows SDK 10.0.26100' $(if ($sdk26100.Count -gt 0) { "已安装（$($sdk26100[0].DisplayName)）" } else { '未安装' })
 
 Write-Host ''

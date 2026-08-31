@@ -28,18 +28,19 @@ if %ERRORLEVEL% EQU 0 goto :ADMIN
 
 rem -------- 未拥有管理员权限，请求 UAC 提升 --------
 echo [!!] 需要管理员权限，正在请求提升 ...
-echo      请在弹出的窗口里点「是」。
+echo      请在弹出的 UAC 窗口里点「是」，安装向导将在新的管理员窗口中继续。
 echo.
 
 powershell.exe -NoProfile -ExecutionPolicy Bypass -Command ^
   "$p = '%PS1%' -replace \"'\", \"''\"; Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',\"`\"$p`\"\") -Verb RunAs -Wait"
 
 echo.
-echo [!!] 如果刚才没有弹出权限窗口，或你在窗口里点了「否」，脚本无法运行。
-echo      也可以右键本文件，选「以管理员身份运行」。
+echo [OK] 管理员窗口已退出。
+echo      若刚才没有弹出 UAC 提示、或在其中点了「否」，
+echo      请右键本文件选「以管理员身份运行」重试。
 echo.
 pause
-exit /b 1
+exit /b 0
 
 :ADMIN
 echo [OK] 已获得管理员权限。

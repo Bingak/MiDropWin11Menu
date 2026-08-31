@@ -34,10 +34,10 @@ MiDropShellExt.dll  ──有 IExplorerCommand、无包标识──▶ 旧菜单
 
    [2] 路线 A 安装   免 SDK 免证书，但会开启系统「开发人员模式」。
 
-   [3] 体验一下      临时启用，重启电脑后自动失效，不留痕迹。
+   [3] 体验一下      注册后立即测试，回车确认后自动注销还原。
                     想先看看效果选这个。
 
-   [4] 彻底删除      注销包 + 还原开关 + 删掉全部生成的文件。
+   [4] 彻底删除      注销包 + 还原开关 + 卸载自动装的 SDK + 删掉全部生成的文件。
 
    [5] 查看当前状态
    [0] 退出
@@ -45,9 +45,9 @@ MiDropShellExt.dll  ──有 IExplorerCommand、无包标识──▶ 旧菜单
 
 几点说明：
 
-- **选 [3] 体验**最保险 —— 它只做临时注册，重启电脑后一切自动还原，适合先看看效果。
+- **选 [3] 体验**最保险 —— 它会注册后让你实际右键测试，回车确认后自动注销、还原开发人员模式开关、清理暂存文件。注意：体验注册不会因重启电脑自动消失，请务必回到窗口按回车完成还原。
 - 选 [1] 时若检测到没装 Windows SDK，脚本会问你要不要自动装（推荐装，只装签名工具，体积很小）。
-- `[4] 彻底删除` 会移除包、把「开发人员模式」还原回关闭、删掉自签名证书，并删除 `C:\ProgramData\MiDropWin11Menu`（含之前做的注册表备份）。它**不会**动小米互联服务本身。
+- `[4] 彻底删除` 会移除包、把「开发人员模式」还原回关闭、删掉自签名证书，**卸载脚本自动安装的 Windows SDK 10.0.26100**，并删除 `C:\ProgramData\MiDropWin11Menu`（含之前做的注册表备份）。它**不会**动小米互联服务本身。
 
 以下两节是命令行方式，效果与菜单里的 [1] [2] 完全一致。
 
@@ -90,6 +90,8 @@ powershell -ExecutionPolicy Bypass -File .\Diagnose.ps1     # 只读体检，不
 powershell -ExecutionPolicy Bypass -File .\Uninstall.ps1    # 完整回滚
 ```
 
+`Uninstall.ps1` 可选开关：`-KeepBackup`（保留备份）、`-KeepDeveloperMode`（不动开发人员模式开关）、`-KeepSdk`（保留 Windows SDK）、`-NoRestartExplorer`。若 Windows SDK 10.0.26100 由脚本自动安装过，卸载时会一并移除；无法确认来源时会询问。SDK 移除顺序：先 `winget uninstall`，失败则按 ARP 里的 ProductCode 走 `msiexec /x /qn`。
+
 ## 文件说明
 
 | 文件 | 说明 |
@@ -99,7 +101,7 @@ powershell -ExecutionPolicy Bypass -File .\Uninstall.ps1    # 完整回滚
 | `sparse/AppxManifest.xml` | 稀疏包清单，已填好原厂 CLSID `{504d69c0-cb52-48df-b5b5-7161829fabc8}` |
 | `Install-RouteB-SignedMsix.ps1` | 路线 B：签名安装（推荐，命令行版） |
 | `Install-RouteA-DevMode.ps1` | 路线 A：免 SDK，需开发人员模式（命令行版） |
-| `Uninstall.ps1` | 回滚：注销包、还原开关、移除证书、校验原厂注册完好 |
+| `Uninstall.ps1` | 回滚：注销包、还原开关、移除证书、卸载自动装的 SDK、校验原厂注册完好 |
 | `Diagnose.ps1` | 只读体检，输出 CLSID / DLL / verb / 包状态 / 开关状态 |
 | `reg/Restore-MiDrop-Original.reg` | 原厂注册状态还原（应急修复用） |
 | `TECHNICAL-NOTES.md` | 实测证据、接口判定、共享内存机制、手工命令 |

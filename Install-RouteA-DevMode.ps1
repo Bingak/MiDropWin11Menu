@@ -96,6 +96,48 @@ if (-not (Test-Path $clsKey)) { Die "原厂 CLSID 未注册：$clsKey —— 请
 Ok "原厂 CLSID 注册完好：$TargetClsid"
 
 # ------------------------------------------------------------ 2. 注册表备份
+# 纯 .NET 的 .reg 导出（回退用）：某些安全策略禁用 reg.exe 会导致备份静默失败。
+function Export-RegKeyPS {
+    param([string]$RootKey, [string]$DestFile)
+    $hiveMap    = @{ 'HKLM' = [Microsoft.Win32.Registry]::LocalMachine; 'HKCU' = [Microsoft.Win32.Registry]::CurrentUser }
+    $hiveNameMap = @{ 'HKLM' = 'HKEY_LOCAL_MACHINE'; 'HKCU' = 'HKEY_CURRENT_USER' }
+    $parts = $RootKey -split '\\', 2
+    if ($parts.Count -lt 2 -or -not $hiveMap.ContainsKey($parts[0])) { return $false }
+    $root = $hiveMap[$parts[0]].OpenSubKey($parts[1])
+    if (-not $root) { return $false }
+    $lines = New-Object System.Collections.Generic.List[string]
+    $lines.Add('Windows Registry Editor Version 5.00')
+    function Escape-RegText([string]$s) { (($s -replace '\\', '\\') -replace '"', '\"') }
+    function Walk($key, [string]$pathText) {
+        $lines.Add('')
+        $lines.Add("[$pathText]")
+        foreach ($vn in $key.GetValueNames()) {
+            $kind = $key.GetValueKind($vn)
+            $val  = $key.GetValue($vn, '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+            $name = if ($vn -eq '') { '@' } else { '"' + (Escape-RegText $vn) + '"' }
+            switch ("$kind") {
+                'String'       { $lines.Add($name + '="' + (Escape-RegText ([string]$val)) + '"') }
+                'ExpandString' { $lines.Add($name + '=hex(2):' + (([Text.Encoding]::Unicode.GetBytes("$val" + [char]0) | ForEach-Object { $_.ToString('x2') }) -join ',')) }
+                'DWord'        { $lines.Add($name + ('=dword:{0:x8}' -f [uint32]$val)) }
+                'QWord'        { $lines.Add($name + '=hex(b):' + (([BitConverter]::GetBytes([uint64]$val) | ForEach-Object { $_.ToString('x2') }) -join ',')) }
+                'Binary'       { $lines.Add($name + '=hex:' + ((@($val) | ForEach-Object { $_.ToString('x2') }) -join ',')) }
+                default        { $lines.Add($name + '="' + (Escape-RegText ([string]$val)) + '"') }
+            }
+        }
+        foreach ($sk in $key.GetSubKeyNames()) {
+            $sub = $null
+            try { $sub = $key.OpenSubKey($sk) } catch { }
+            if ($sub) { Walk $sub "$pathText\$sk" }
+        }
+    }
+    Walk $root ("{0}\{1}" -f $hiveNameMap[$parts[0]], $parts[1])
+    try {
+        [IO.File]::WriteAllLines($DestFile, $lines, [Text.Encoding]::Unicode)
+        return $true
+    }
+    catch { return $false }
+}
+
 New-Item -ItemType Directory -Force -Path $BackupDir | Out-Null
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $exports = @{
@@ -106,6 +148,10 @@ $exports = @{
 foreach ($kv in $exports.GetEnumerator()) {
     $dest = Join-Path $BackupDir $kv.Key
     & "$env:WINDIR\System32\reg.exe" export $kv.Value $dest /y | Out-Null
+    if (-not (Test-Path -LiteralPath $dest)) {
+        # reg.exe 被安全策略禁用 / 导出失败 → 纯 .NET 回退
+        $null = Export-RegKeyPS -RootKey $kv.Value -DestFile $dest
+    }
     if (Test-Path -LiteralPath $dest) { Ok "已备份 $($kv.Value)" } else { Warn "备份失败：$($kv.Value)" }
 }
 Info "备份目录：$BackupDir"

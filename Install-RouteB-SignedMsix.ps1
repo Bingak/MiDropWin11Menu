@@ -62,10 +62,16 @@ function Find-SdkTool([string]$name) {
     }
     foreach ($root in @('C:\Program Files (x86)\Windows Kits\10\bin', 'C:\Program Files\Windows Kits\10\bin')) {
         if (-not (Test-Path $root)) { continue }
-        $hit = Get-ChildItem $root -Recurse -Filter $name -ErrorAction SilentlyContinue |
-               Where-Object { (Split-Path $_.DirectoryName -Leaf) -ieq 'x64' } |
-               Sort-Object FullName -Descending | Select-Object -First 1
-        if ($hit) { return $hit.FullName }
+        # 按真实版本号降序（目录名字符串排序会把 10.0.9900 错排到 10.0.26100 前面）
+        $dirs = Get-ChildItem $root -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+            $v = $null
+            try { $v = [version]$_.Name } catch { }
+            if ($v) { [pscustomobject]@{ Ver = $v; Dir = $_.FullName } }
+        } | Sort-Object Ver -Descending
+        foreach ($d in $dirs) {
+            $p = Join-Path $d.Dir "x64\$name"
+            if (Test-Path -LiteralPath $p) { return $p }
+        }
     }
     return $null
 }
@@ -101,14 +107,63 @@ if (-not (Test-Path "HKLM:\SOFTWARE\Classes\CLSID\$TargetClsid\InprocServer32"))
 Ok '原厂 CLSID 注册完好。'
 
 # ------------------------------------------------------------ 2. 注册表备份
+# 纯 .NET 的 .reg 导出（回退用）：某些安全策略禁用 reg.exe 会导致备份静默失败。
+function Export-RegKeyPS {
+    param([string]$RootKey, [string]$DestFile)
+    $hiveMap    = @{ 'HKLM' = [Microsoft.Win32.Registry]::LocalMachine; 'HKCU' = [Microsoft.Win32.Registry]::CurrentUser }
+    $hiveNameMap = @{ 'HKLM' = 'HKEY_LOCAL_MACHINE'; 'HKCU' = 'HKEY_CURRENT_USER' }
+    $parts = $RootKey -split '\\', 2
+    if ($parts.Count -lt 2 -or -not $hiveMap.ContainsKey($parts[0])) { return $false }
+    $root = $hiveMap[$parts[0]].OpenSubKey($parts[1])
+    if (-not $root) { return $false }
+    $lines = New-Object System.Collections.Generic.List[string]
+    $lines.Add('Windows Registry Editor Version 5.00')
+    function Escape-RegText([string]$s) { (($s -replace '\\', '\\') -replace '"', '\"') }
+    function Walk($key, [string]$pathText) {
+        $lines.Add('')
+        $lines.Add("[$pathText]")
+        foreach ($vn in $key.GetValueNames()) {
+            $kind = $key.GetValueKind($vn)
+            $val  = $key.GetValue($vn, '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+            $name = if ($vn -eq '') { '@' } else { '"' + (Escape-RegText $vn) + '"' }
+            switch ("$kind") {
+                'String'       { $lines.Add($name + '="' + (Escape-RegText ([string]$val)) + '"') }
+                'ExpandString' { $lines.Add($name + '=hex(2):' + (([Text.Encoding]::Unicode.GetBytes("$val" + [char]0) | ForEach-Object { $_.ToString('x2') }) -join ',')) }
+                'DWord'        { $lines.Add($name + ('=dword:{0:x8}' -f [uint32]$val)) }
+                'QWord'        { $lines.Add($name + '=hex(b):' + (([BitConverter]::GetBytes([uint64]$val) | ForEach-Object { $_.ToString('x2') }) -join ',')) }
+                'Binary'       { $lines.Add($name + '=hex:' + ((@($val) | ForEach-Object { $_.ToString('x2') }) -join ',')) }
+                default        { $lines.Add($name + '="' + (Escape-RegText ([string]$val)) + '"') }
+            }
+        }
+        foreach ($sk in $key.GetSubKeyNames()) {
+            $sub = $null
+            try { $sub = $key.OpenSubKey($sk) } catch { }
+            if ($sub) { Walk $sub "$pathText\$sk" }
+        }
+    }
+    Walk $root ("{0}\{1}" -f $hiveNameMap[$parts[0]], $parts[1])
+    try {
+        [IO.File]::WriteAllLines($DestFile, $lines, [Text.Encoding]::Unicode)
+        return $true
+    }
+    catch { return $false }
+}
+
 New-Item -ItemType Directory -Force -Path $BackupDir | Out-Null
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-@{
+$backupTargets = @{
     "CLSID-$stamp.reg"    = "HKLM\SOFTWARE\Classes\CLSID\$TargetClsid"
     "VerbStar-$stamp.reg" = 'HKLM\SOFTWARE\Classes\*\shell\MiDropExtMenu'
     "VerbDir-$stamp.reg"  = 'HKLM\SOFTWARE\Classes\Directory\shell\MiDropExtMenu'
-}.GetEnumerator() | ForEach-Object {
-    & "$env:WINDIR\System32\reg.exe" export $_.Value (Join-Path $BackupDir $_.Key) /y | Out-Null
+}
+foreach ($kv in $backupTargets.GetEnumerator()) {
+    $dest = Join-Path $BackupDir $kv.Key
+    & "$env:WINDIR\System32\reg.exe" export $kv.Value $dest /y | Out-Null
+    if (-not (Test-Path -LiteralPath $dest)) {
+        # reg.exe 被安全策略禁用 / 导出失败 → 纯 .NET 回退
+        $null = Export-RegKeyPS -RootKey $kv.Value -DestFile $dest
+    }
+    if (Test-Path -LiteralPath $dest) { Ok "已备份 $($kv.Value)" } else { Warn "备份失败：$($kv.Value)" }
 }
 Ok "注册表已备份到 $BackupDir"
 
