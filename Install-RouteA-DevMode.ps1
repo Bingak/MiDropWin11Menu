@@ -27,6 +27,7 @@
    如需脚本自动打开开发人员模式，追加 -EnableDeveloperMode
 ================================================================================
 #>
+#Requires -Version 5.1
 [CmdletBinding()]
 param(
     # 自动写入 HKLM\...\AppModelUnlock\AllowDevelopmentWithoutDevLicense = 1
@@ -37,7 +38,9 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $PackageName = 'MiDropWin11MenuShim'
-$StageRoot   = 'C:\ProgramData\MiDropWin11Menu'
+# 用 ProgramFiles / ProgramData 环境变量，避免系统盘不是 C: 时找不到
+$MiRoot      = Join-Path ${env:ProgramFiles} 'MI\HyperConnect'
+$StageRoot   = Join-Path ${env:ProgramData} 'MiDropWin11Menu'
 $StageSparse = Join-Path $StageRoot 'sparse'
 $BackupDir   = Join-Path $StageRoot 'backup'
 $MarkerFile  = Join-Path $StageRoot 'install-state.json'
@@ -60,7 +63,7 @@ if ($build -lt 22000) { Die "当前系统内部版本 $build 不是 Windows 11�
 Info "系统内部版本 $build，64 位，检查通过。"
 
 # ------------------------------------------------- 1. 定位小米互联服务安装目录
-$candidates = Get-ChildItem 'C:\Program Files\MI\HyperConnect' -Directory -ErrorAction SilentlyContinue |
+$candidates = @(Get-ChildItem -LiteralPath $MiRoot -Directory -ErrorAction SilentlyContinue |
     ForEach-Object {
         $dll = Join-Path $_.FullName 'resources\native-interconnect\win32\MiDropShellExt.dll'
         if (Test-Path -LiteralPath $dll) {
@@ -73,9 +76,9 @@ $candidates = Get-ChildItem 'C:\Program Files\MI\HyperConnect' -Directory -Error
                 Dll     = $dll
             }
         }
-    } | Sort-Object Version -Descending
+    } | Sort-Object Version -Descending)
 
-if (-not $candidates) { Die '未找到 MiDropShellExt.dll，请确认小米互联服务已安装。' }
+if ($candidates.Count -eq 0) { Die '未找到 MiDropShellExt.dll，请确认小米互联服务已安装。' }
 $mi = $candidates[0]
 Ok "组件目录：$($mi.Win32)"
 Ok "处理器 DLL：$($mi.Dll)"
@@ -246,7 +249,12 @@ if ($NoRestartExplorer) {
 else {
     Info '重启 explorer.exe 以重载右键菜单注册 …'
     Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
-    Start-Sleep -Seconds 2
+    # 轮询等系统自动拉起（AutoRestartShell），最多 15 秒；超时才手动启动
+    $deadline = (Get-Date).AddSeconds(15)
+    while ((Get-Date) -lt $deadline) {
+        if (Get-Process -Name explorer -ErrorAction SilentlyContinue) { break }
+        Start-Sleep -Milliseconds 500
+    }
     if (-not (Get-Process -Name explorer -ErrorAction SilentlyContinue)) { Start-Process explorer.exe }
     Ok 'explorer.exe 已重启。'
 }
