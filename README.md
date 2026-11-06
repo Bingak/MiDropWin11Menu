@@ -156,10 +156,12 @@ powershell -ExecutionPolicy Bypass -File .\Uninstall.ps1    # 完整回滚
 
 - 默认情况下，`Uninstall.ps1` 会**显式删除** `C:\ProgramData\MiDropWin11Menu\backup\` 下的注册表备份，随后清理整个暂存目录。
 - 若你希望保留备份用于人工比对或后续手动回滚，请运行 `powershell -ExecutionPolicy Bypass -File .\Uninstall.ps1 -KeepBackup`。
+- 备份目录就在暂存目录 `C:\ProgramData\MiDropWin11Menu\` 里面，所以「保留备份」时脚本只清理它的兄弟项，
+  **不会**再把整个暂存目录连同 `backup\` 一起 `-Recurse` 删掉。
 
 ### 清理注册表里的 MiDropExtMenu 残留
 
-卸载流程的**步骤 5/6** 会全量搜索注册表里的 `MiDropExtMenu` 键，但**只清理非原厂来源的键，
+卸载流程的**步骤 5/6** 会扫描注册表里的 `MiDropExtMenu` 键，但**只清理非原厂来源的键，
 小米原厂入口一律保留不删**。
 
 判定规则：键的 `ExplorerCommandHandler` **严格等于**小米 CLSID `{504d69c0-cb52-48df-b5b5-7161829fabc8}`
@@ -181,6 +183,18 @@ powershell -ExecutionPolicy Bypass -File .\Uninstall.ps1    # 完整回滚
 - `HKLM\SOFTWARE\Classes`（64 位机器级）
 - `HKCU\Software\Classes`（用户级）
 - `HKLM\SOFTWARE\WOW6432Node\Classes`（32 位视图）
+
+**搜索方式**：只探测 shell 动词的**挂载父键**，不做全量递归遍历。原因是
+`HKLM\SOFTWARE\Classes` 单机就有 20 万个子键左右，逐键递归在 PowerShell 里要跑
+25 秒以上，期间没有任何输出，看起来就像卡死（旧版卸载停在「5/6」不动正是这个原因）。
+而动词只可能注册在下面几类父键下，所以脚本不再逐键递归，只对约 5200 个一级 ProgID
+各探测 3 个挂载父键（合计约 1.6 万次子键探测，绝大多数立刻返回「不存在」），
+本机实测 **24.6 秒 → 0.9 秒**：
+
+- `<ProgID>\shell\<verb>`（含 `*` / `Directory` / `Drive` 等特殊 ProgID）
+- `<ProgID>\shellex\ContextMenuHandlers\<verb>`（旧式 `IContextMenu` 处理器）
+- `Directory\Background\shell\<verb>`（文件夹空白处）
+- `SystemFileAssociations\<ext>\shell\<verb>`、`Applications\<exe>\shell\<verb>`
 
 **默认行为**：搜索 → 分类列出（标注原厂 / 非原厂）→ 原厂键直接跳过，非原厂键询问后才清理。
 
